@@ -122,17 +122,18 @@ const Input = (() => {
 
 // ═══════════════════════════════════════════════════════════════
 //  TOUCH CONTROLS
-//  D-pad (◀ ▶) bottom-left  |  SHOOT + JUMP bottom-right
-//  All positions are in 900×506 canvas-space so hit-tests are
-//  exact regardless of CSS scaling.
+//  Bottom-left : [◀] [▶]
+//  Bottom-center: [SWAP]  (character switch)
+//  Bottom-right : [✦ SHOOT] [▲ JUMP]
+//  All coords in 900×506 canvas-space; hit-tests divide by _cssScale.
 // ═══════════════════════════════════════════════════════════════
 const TouchControls = (() => {
   const S  = 84;   // button size (canvas px)
   const G  = 10;   // gap between sibling buttons
-  const MX = 22;   // horizontal margin from canvas edge
-  const MY = 18;   // vertical margin from canvas bottom
+  const SW = 72;   // swap button width (slightly narrower)
+  const MX = 22;   // margin from canvas edge
+  const MY = 18;   // margin from canvas bottom
 
-  // Convert a DOM touch point → canvas-space coordinates
   function toCanvas(clientX, clientY) {
     const r = canvas.getBoundingClientRect();
     return {
@@ -141,14 +142,15 @@ const TouchControls = (() => {
     };
   }
 
-  // Button layout (computed fresh each query so resize is free)
   function rect(id) {
-    const y = NATIVE_H - MY - S;
+    const y  = NATIVE_H - MY - S;
+    const sy = NATIVE_H - MY - S + (S - SW) / 2;  // vertically center swap
     switch (id) {
-      case 'left':  return { x: MX,             y, w: S, h: S };
-      case 'right': return { x: MX + S + G,     y, w: S, h: S };
-      case 'shoot': return { x: NATIVE_W - MX - S * 2 - G, y, w: S, h: S };
-      case 'jump':  return { x: NATIVE_W - MX - S,         y, w: S, h: S };
+      case 'left':  return { x: MX,                           y,  w: S,  h: S  };
+      case 'right': return { x: MX + S + G,                   y,  w: S,  h: S  };
+      case 'swap':  return { x: NATIVE_W / 2 - SW / 2,        y: sy, w: SW, h: SW };
+      case 'shoot': return { x: NATIVE_W - MX - S * 2 - G,    y,  w: S,  h: S  };
+      case 'jump':  return { x: NATIVE_W - MX - S,            y,  w: S,  h: S  };
     }
   }
 
@@ -157,9 +159,9 @@ const TouchControls = (() => {
     return cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h;
   }
 
-  // One-shot shoot flag
-  let _shootFired = false;
-  let _shootFlash = 0;  // frames to show shoot button as "pressed"
+  // One-shot flags for tap actions
+  let _shootFired = false, _shootFlash = 0;
+  let _swapFired  = false, _swapFlash  = 0;
 
   function syncHeld(touches) {
     _touch.left = false; _touch.right = false; _touch.jump = false;
@@ -177,6 +179,7 @@ const TouchControls = (() => {
     for (let i = 0; i < e.changedTouches.length; i++) {
       const { x, y } = toCanvas(e.changedTouches[i].clientX, e.changedTouches[i].clientY);
       if (hit(x, y, 'shoot')) { _shootFired = true; _shootFlash = 10; }
+      if (hit(x, y, 'swap'))  { _swapFired  = true; _swapFlash  = 12; }
     }
   }, { passive: false });
 
@@ -187,65 +190,79 @@ const TouchControls = (() => {
     _touch.left = false; _touch.right = false; _touch.jump = false;
   }, { passive: false });
 
-  // Called once per game frame — returns true if shoot was tapped this frame
   function consumeShoot() {
     const v = _shootFired; _shootFired = false;
     if (_shootFlash > 0) _shootFlash--;
     return v;
   }
+  function consumeSwap() {
+    const v = _swapFired; _swapFired = false;
+    if (_swapFlash > 0) _swapFlash--;
+    return v;
+  }
 
   // ── Button rendering ──────────────────────────────────────
-  function drawBtn(id, pressed) {
+  const themes = {
+    left:  { a: '#14532d', b: '#052e16', border: '#4ade80', icon: '◀',       twoLine: false },
+    right: { a: '#14532d', b: '#052e16', border: '#4ade80', icon: '▶',       twoLine: false },
+    swap:  { a: '#92400e', b: '#451a03', border: '#fbbf24', icon: '✨\nSWAP', twoLine: true  },
+    shoot: { a: '#4c1d95', b: '#2e1065', border: '#c084fc', icon: '✦\nSHOOT',twoLine: true  },
+    jump:  { a: '#075985', b: '#0c4a6e', border: '#38bdf8', icon: '▲\nJUMP', twoLine: true  },
+  };
+
+  function drawBtn(id, active) {
     const r = rect(id);
-
-    // Drop shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    ctx.roundRect(r.x + 3, r.y + 5, r.w, r.h, 18);
-    ctx.fill();
-
-    // Colour theme per button
-    const themes = {
-      left:  { a: '#166534', b: '#14532d', border: '#86efac', icon: '◀' },
-      right: { a: '#166534', b: '#14532d', border: '#86efac', icon: '▶' },
-      shoot: { a: '#7c3aed', b: '#4c1d95', border: '#c084fc', icon: '✦\nSHOOT' },
-      jump:  { a: '#0369a1', b: '#075985', border: '#67e8f9', icon: '▲\nJUMP' },
-    };
     const t = themes[id];
+    const oy = active ? 2 : 0;  // press-down shift
 
-    const grad = ctx.createLinearGradient(r.x, r.y, r.x, r.y + r.h);
-    grad.addColorStop(0, pressed ? t.b : t.a);
-    grad.addColorStop(1, pressed ? t.a : t.b);
-    ctx.fillStyle = grad;
-    ctx.globalAlpha = pressed ? 0.97 : 0.72;
-    ctx.roundRect(r.x, r.y + (pressed ? 2 : 0), r.w, r.h, 18);
+    // Hard drop shadow — gives depth against any background
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.roundRect(r.x + 4, r.y + 6 + oy, r.w, r.h, 18);
     ctx.fill();
 
-    // Glow border
+    // Dark outer ring (contrast ring that works on both light and dark BG)
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.roundRect(r.x - 2, r.y - 2 + oy, r.w + 4, r.h + 4, 20);
+    ctx.fill();
+
+    // Button body — fully opaque gradient
+    const grad = ctx.createLinearGradient(r.x, r.y + oy, r.x, r.y + r.h + oy);
+    grad.addColorStop(0, active ? t.b : t.a);
+    grad.addColorStop(1, active ? t.a : t.b);
+    ctx.fillStyle = grad;
+    ctx.globalAlpha = 1;
+    ctx.roundRect(r.x, r.y + oy, r.w, r.h, 18);
+    ctx.fill();
+
+    // Coloured border — always full opacity so it reads clearly
     ctx.strokeStyle = t.border;
-    ctx.lineWidth = pressed ? 2.5 : 1.8;
-    ctx.globalAlpha = pressed ? 1 : 0.55;
-    if (pressed) { ctx.shadowColor = t.border; ctx.shadowBlur = 14; }
-    ctx.roundRect(r.x, r.y + (pressed ? 2 : 0), r.w, r.h, 18);
+    ctx.lineWidth = active ? 3 : 2.5;
+    if (active) { ctx.shadowColor = t.border; ctx.shadowBlur = 16; }
+    ctx.roundRect(r.x, r.y + oy, r.w, r.h, 18);
     ctx.stroke();
     ctx.shadowBlur = 0;
-    ctx.globalAlpha = 1;
 
-    // Label — single char or two-line (icon + word)
-    ctx.fillStyle = '#fff';
+    // Inner highlight strip (top edge glint)
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.roundRect(r.x + 6, r.y + oy + 4, r.w - 12, r.h * 0.3, 10);
+    ctx.fill();
+
+    // Label text with strong shadow so it pops off any colour
+    ctx.fillStyle = '#ffffff';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.shadowColor = 'rgba(0,0,0,0.6)';
-    ctx.shadowBlur = 4;
-    const lines = t.icon.split('\n');
-    const cy = r.y + (pressed ? 2 : 0) + r.h / 2;
-    if (lines.length === 1) {
-      ctx.font = `bold ${Math.round(r.h * 0.5)}px Georgia`;
-      ctx.fillText(lines[0], r.x + r.w / 2, cy);
+    ctx.shadowColor = 'rgba(0,0,0,0.9)';
+    ctx.shadowBlur = 6;
+    const cy = r.y + oy + r.h / 2;
+    if (!t.twoLine) {
+      ctx.font = `bold ${Math.round(r.h * 0.52)}px Georgia`;
+      ctx.fillText(t.icon, r.x + r.w / 2, cy);
     } else {
-      ctx.font = `bold ${Math.round(r.h * 0.34)}px Georgia`;
-      ctx.fillText(lines[0], r.x + r.w / 2, cy - r.h * 0.14);
-      ctx.font = `bold ${Math.round(r.h * 0.22)}px Georgia`;
-      ctx.fillText(lines[1], r.x + r.w / 2, cy + r.h * 0.22);
+      const [top, bot] = t.icon.split('\n');
+      ctx.font = `bold ${Math.round(r.h * 0.32)}px Georgia`;
+      ctx.fillText(top, r.x + r.w / 2, cy - r.h * 0.14);
+      ctx.font = `bold ${Math.round(r.h * 0.21)}px Georgia`;
+      ctx.fillText(bot, r.x + r.w / 2, cy + r.h * 0.22);
     }
     ctx.shadowBlur = 0;
     ctx.textBaseline = 'alphabetic';
@@ -253,14 +270,15 @@ const TouchControls = (() => {
   }
 
   function draw() {
-    if (!IS_TOUCH) return;   // hide on desktop
+    if (!IS_TOUCH) return;
     drawBtn('left',  _touch.left);
     drawBtn('right', _touch.right);
+    drawBtn('swap',  _swapFlash > 0);
     drawBtn('shoot', _shootFlash > 0);
     drawBtn('jump',  _touch.jump);
   }
 
-  return { consumeShoot, draw };
+  return { consumeShoot, consumeSwap, draw };
 })();
 
 // ═══════════════════════════════════════════════════════════════
@@ -1115,20 +1133,21 @@ const platforms = buildSkyIslandWorld();
 let activeChar = 'penelope';
 let player = new Player(160, 490, activeChar);
 
-// Switch character with Tab
+// Character switch — called by Tab key and touch SWAP button
+function switchCharacter() {
+  activeChar = activeChar === 'penelope' ? 'parker' : 'penelope';
+  const np = new Player(player.x, player.y, activeChar);
+  np.vx = player.vx;
+  np.vy = -4;
+  player = np;
+  Particles.spawn(player.x + player.w / 2, player.y + player.h / 2, {
+    count: 14, color: activeChar === 'penelope' ? '#c084fc' : '#67e8f9',
+    spread: 5, rise: 4, star: true, size: 6, decay: 0.02,
+  });
+}
+
 window.addEventListener('keydown', e => {
-  if (e.code === 'Tab') {
-    e.preventDefault();
-    activeChar = activeChar === 'penelope' ? 'parker' : 'penelope';
-    const np = new Player(player.x, player.y, activeChar);
-    np.vx = player.vx;
-    np.vy = -4;   // little pop on switch
-    player = np;
-    Particles.spawn(player.x + player.w / 2, player.y + player.h / 2, {
-      count: 14, color: activeChar === 'penelope' ? '#c084fc' : '#67e8f9',
-      spread: 5, rise: 4, star: true, size: 6, decay: 0.02,
-    });
-  }
+  if (e.code === 'Tab') { e.preventDefault(); switchCharacter(); }
 });
 
 function gameLoop() {
@@ -1141,6 +1160,9 @@ function gameLoop() {
   // Shoot: touch button OR Z key on keyboard
   if (TouchControls.consumeShoot() || Input.wasPressed('Space')) {
     shootAction(player);
+  }
+  if (TouchControls.consumeSwap()) {
+    switchCharacter();
   }
 
   Input.clearFrame();
