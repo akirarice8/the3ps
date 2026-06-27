@@ -1,0 +1,1169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>The 3 P's Heroic Adventure</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      background: #0c1445;
+      overflow: hidden;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      font-family: Georgia, serif;
+    }
+    #wrapper {
+      width: 100vw;
+      height: 100dvh; /* dynamic viewport height — respects iPad browser chrome */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      display: block;
+      /* CSS size set by JS to fill screen while keeping 900×506 aspect ratio */
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+<div id="wrapper">
+<canvas id="gameCanvas" width="900" height="506"></canvas>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  THE 3 P'S HEROIC ADVENTURE  —  Session 1: Sky Island World
+//  Architecture: Input → Update (Physics/AI) → Draw
+//  Future hooks: enemies[], projectiles[], worlds[], helpers[]
+// ═══════════════════════════════════════════════════════════════
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// ── Responsive full-screen scaling ────────────────────────────
+// Internal resolution is fixed at 900×506; CSS scales to fill the viewport.
+// All game coordinates (camera, HUD, touch hit-tests) stay in 900×506 space.
+const NATIVE_W = 900, NATIVE_H = 506;
+let _cssScale = 1; // current CSS px per canvas px — used for touch mapping
+
+function resizeCanvas() {
+  const sw = window.innerWidth, sh = window.innerHeight;
+  _cssScale = Math.min(sw / NATIVE_W, sh / NATIVE_H);
+  canvas.style.width  = (_cssScale * NATIVE_W) + 'px';
+  canvas.style.height = (_cssScale * NATIVE_H) + 'px';
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// Touch detection (hide keyboard hints when touch device)
+const IS_TOUCH = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+
+// ── Tunable constants ─────────────────────────────────────────
+const CFG = {
+  GRAVITY:         0.42,
+  JUMP_FORCE:     -11.5,
+  MOVE_SPEED:      4.8,
+  FRICTION:        0.76,   // horizontal deceleration when no key held
+  TERMINAL_VEL:   14,
+  WORLD_W:        5000,
+  WORLD_H:        1000,
+  CAM_LERP:       0.09,
+};
+
+// ── roundRect polyfill (safety for older browsers) ────────────
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    this.beginPath();
+    this.moveTo(x + r, y);
+    this.lineTo(x + w - r, y);
+    this.arcTo(x + w, y, x + w, y + r, r);
+    this.lineTo(x + w, y + h - r);
+    this.arcTo(x + w, y + h, x + w - r, y + h, r);
+    this.lineTo(x + r, y + h);
+    this.arcTo(x, y + h, x, y + h - r, r);
+    this.lineTo(x, y + r);
+    this.arcTo(x, y, x + r, y, r);
+    this.closePath();
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  INPUT  (keyboard + touch — both update the same logical state)
+// ═══════════════════════════════════════════════════════════════
+
+// Touch button state — written by TouchControls, read by Input
+const _touch = { left: false, right: false, jump: false };
+
+const Input = (() => {
+  const held = {};
+  const pressed = {};
+  window.addEventListener('keydown', e => {
+    if (!held[e.code]) pressed[e.code] = true;
+    held[e.code] = true;
+    if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Tab'].includes(e.code))
+      e.preventDefault();
+  });
+  window.addEventListener('keyup', e => { held[e.code] = false; });
+  return {
+    left:       () => held['ArrowLeft']  || held['KeyA']  || _touch.left,
+    right:      () => held['ArrowRight'] || held['KeyD']  || _touch.right,
+    jump:       () => held['ArrowUp'] || held['KeyW'] || _touch.jump,
+    wasPressed: (code) => { const v = pressed[code]; pressed[code] = false; return v; },
+    clearFrame: () => { for (const k in pressed) pressed[k] = false; },
+  };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  TOUCH CONTROLS
+//  D-pad (◀ ▶) bottom-left  |  SHOOT + JUMP bottom-right
+//  All positions are in 900×506 canvas-space so hit-tests are
+//  exact regardless of CSS scaling.
+// ═══════════════════════════════════════════════════════════════
+const TouchControls = (() => {
+  const S  = 84;   // button size (canvas px)
+  const G  = 10;   // gap between sibling buttons
+  const MX = 22;   // horizontal margin from canvas edge
+  const MY = 18;   // vertical margin from canvas bottom
+
+  // Convert a DOM touch point → canvas-space coordinates
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - r.left) / _cssScale,
+      y: (clientY - r.top)  / _cssScale,
+    };
+  }
+
+  // Button layout (computed fresh each query so resize is free)
+  function rect(id) {
+    const y = NATIVE_H - MY - S;
+    switch (id) {
+      case 'left':  return { x: MX,             y, w: S, h: S };
+      case 'right': return { x: MX + S + G,     y, w: S, h: S };
+      case 'shoot': return { x: NATIVE_W - MX - S * 2 - G, y, w: S, h: S };
+      case 'jump':  return { x: NATIVE_W - MX - S,         y, w: S, h: S };
+    }
+  }
+
+  function hit(cx, cy, id) {
+    const r = rect(id);
+    return cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h;
+  }
+
+  // One-shot shoot flag
+  let _shootFired = false;
+  let _shootFlash = 0;  // frames to show shoot button as "pressed"
+
+  function syncHeld(touches) {
+    _touch.left = false; _touch.right = false; _touch.jump = false;
+    for (let i = 0; i < touches.length; i++) {
+      const { x, y } = toCanvas(touches[i].clientX, touches[i].clientY);
+      if (hit(x, y, 'left'))  _touch.left  = true;
+      if (hit(x, y, 'right')) _touch.right = true;
+      if (hit(x, y, 'jump'))  _touch.jump  = true;
+    }
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    syncHeld(e.touches);
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      const { x, y } = toCanvas(e.changedTouches[i].clientX, e.changedTouches[i].clientY);
+      if (hit(x, y, 'shoot')) { _shootFired = true; _shootFlash = 10; }
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove',   e => { e.preventDefault(); syncHeld(e.touches); }, { passive: false });
+  canvas.addEventListener('touchend',    e => { e.preventDefault(); syncHeld(e.touches); }, { passive: false });
+  canvas.addEventListener('touchcancel', e => {
+    e.preventDefault();
+    _touch.left = false; _touch.right = false; _touch.jump = false;
+  }, { passive: false });
+
+  // Called once per game frame — returns true if shoot was tapped this frame
+  function consumeShoot() {
+    const v = _shootFired; _shootFired = false;
+    if (_shootFlash > 0) _shootFlash--;
+    return v;
+  }
+
+  // ── Button rendering ──────────────────────────────────────
+  function drawBtn(id, pressed) {
+    const r = rect(id);
+
+    // Drop shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.roundRect(r.x + 3, r.y + 5, r.w, r.h, 18);
+    ctx.fill();
+
+    // Colour theme per button
+    const themes = {
+      left:  { a: '#166534', b: '#14532d', border: '#86efac', icon: '◀' },
+      right: { a: '#166534', b: '#14532d', border: '#86efac', icon: '▶' },
+      shoot: { a: '#7c3aed', b: '#4c1d95', border: '#c084fc', icon: '✦\nSHOOT' },
+      jump:  { a: '#0369a1', b: '#075985', border: '#67e8f9', icon: '▲\nJUMP' },
+    };
+    const t = themes[id];
+
+    const grad = ctx.createLinearGradient(r.x, r.y, r.x, r.y + r.h);
+    grad.addColorStop(0, pressed ? t.b : t.a);
+    grad.addColorStop(1, pressed ? t.a : t.b);
+    ctx.fillStyle = grad;
+    ctx.globalAlpha = pressed ? 0.97 : 0.72;
+    ctx.roundRect(r.x, r.y + (pressed ? 2 : 0), r.w, r.h, 18);
+    ctx.fill();
+
+    // Glow border
+    ctx.strokeStyle = t.border;
+    ctx.lineWidth = pressed ? 2.5 : 1.8;
+    ctx.globalAlpha = pressed ? 1 : 0.55;
+    if (pressed) { ctx.shadowColor = t.border; ctx.shadowBlur = 14; }
+    ctx.roundRect(r.x, r.y + (pressed ? 2 : 0), r.w, r.h, 18);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+
+    // Label — single char or two-line (icon + word)
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(0,0,0,0.6)';
+    ctx.shadowBlur = 4;
+    const lines = t.icon.split('\n');
+    const cy = r.y + (pressed ? 2 : 0) + r.h / 2;
+    if (lines.length === 1) {
+      ctx.font = `bold ${Math.round(r.h * 0.5)}px Georgia`;
+      ctx.fillText(lines[0], r.x + r.w / 2, cy);
+    } else {
+      ctx.font = `bold ${Math.round(r.h * 0.34)}px Georgia`;
+      ctx.fillText(lines[0], r.x + r.w / 2, cy - r.h * 0.14);
+      ctx.font = `bold ${Math.round(r.h * 0.22)}px Georgia`;
+      ctx.fillText(lines[1], r.x + r.w / 2, cy + r.h * 0.22);
+    }
+    ctx.shadowBlur = 0;
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+  }
+
+  function draw() {
+    if (!IS_TOUCH) return;   // hide on desktop
+    drawBtn('left',  _touch.left);
+    drawBtn('right', _touch.right);
+    drawBtn('shoot', _shootFlash > 0);
+    drawBtn('jump',  _touch.jump);
+  }
+
+  return { consumeShoot, draw };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  CAMERA
+// ═══════════════════════════════════════════════════════════════
+const Camera = {
+  x: 0, y: 0,
+  W: canvas.width, H: canvas.height,
+
+  update(target) {
+    const tx = target.x + target.w / 2 - this.W / 2;
+    const ty = target.y + target.h / 2 - this.H * 0.52;
+    this.x += (tx - this.x) * CFG.CAM_LERP;
+    this.y += (ty - this.y) * CFG.CAM_LERP;
+    this.x = Math.max(0, Math.min(this.x, CFG.WORLD_W - this.W));
+    this.y = Math.max(0, Math.min(this.y, CFG.WORLD_H - this.H));
+  },
+
+  toScreen(wx, wy) { return { x: wx - this.x, y: wy - this.y }; },
+
+  inView(x, y, w, h, pad = 60) {
+    return x + w > this.x - pad && x < this.x + this.W + pad &&
+           y + h > this.y - pad && y < this.y + this.H + pad;
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  PARTICLES  (sparkles, dust, landing puffs)
+// ═══════════════════════════════════════════════════════════════
+const Particles = (() => {
+  const pool = [];
+
+  function spawn(x, y, opts = {}) {
+    const count = opts.count ?? 6;
+    for (let i = 0; i < count; i++) {
+      pool.push({
+        x, y,
+        vx: (Math.random() - 0.5) * (opts.spread ?? 3.5),
+        vy: -Math.random() * (opts.rise ?? 3) - 0.5,
+        color: opts.color ?? '#fbbf24',
+        size:  Math.random() * (opts.size ?? 4) + 2,
+        life:  1,
+        decay: opts.decay ?? 0.025,
+        gravity: opts.gravity ?? 0.06,
+        star: opts.star ?? false,
+      });
+    }
+  }
+
+  function update() {
+    for (let i = pool.length - 1; i >= 0; i--) {
+      const p = pool[i];
+      p.x += p.vx; p.y += p.vy;
+      p.vy += p.gravity;
+      p.vx *= 0.97;
+      p.life -= p.decay;
+      if (p.life <= 0) pool.splice(i, 1);
+    }
+  }
+
+  function draw() {
+    for (const p of pool) {
+      const s = Camera.toScreen(p.x, p.y);
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.fillStyle = p.color;
+      if (p.star) {
+        drawStar(ctx, s.x, s.y, p.size * p.life, 5, p.color);
+      } else {
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  return { spawn, update, draw };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  SHOOT ACTION  (Session 2: replace body with projectile spawn)
+//  Called by SHOOT button (touch) or Z key (keyboard).
+// ═══════════════════════════════════════════════════════════════
+function shootAction(player) {
+  // Placeholder visual until projectiles are implemented next session.
+  // Replace this body with: projectiles.push(new Projectile(player)) etc.
+  const originX = player.x + (player.facingRight ? player.w + 6 : -6);
+  const originY = player.y + player.h * 0.38;
+  Particles.spawn(originX, originY, {
+    count: 10,
+    color: player.character === 'penelope' ? '#c084fc' : '#67e8f9',
+    star:  true,
+    size:  5,
+    spread: 5,
+    rise:  1.5,
+    decay: 0.05,
+  });
+}
+
+// Shared star draw helper
+function drawStar(ctx, cx, cy, r, points, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  for (let i = 0; i < points * 2; i++) {
+    const angle = (i * Math.PI) / points - Math.PI / 2;
+    const rad   = i % 2 === 0 ? r : r * 0.42;
+    if (i === 0) ctx.moveTo(cx + rad * Math.cos(angle), cy + rad * Math.sin(angle));
+    else         ctx.lineTo(cx + rad * Math.cos(angle), cy + rad * Math.sin(angle));
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PLATFORM
+// ═══════════════════════════════════════════════════════════════
+class Platform {
+  // style: 'island' | 'cloud' | 'thin'
+  constructor(x, y, w, h, style = 'island') {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.style = style;
+    this._seed = x * 0.01 + y * 0.003;  // deterministic decoration seed
+  }
+
+  // Shared AABB overlap check used by Player
+  overlaps(px, py, pw, ph) {
+    return px < this.x + this.w && px + pw > this.x &&
+           py < this.y + this.h && py + ph > this.y;
+  }
+
+  draw() {
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const { x, y } = Camera.toScreen(this.x, this.y);
+    if      (this.style === 'island') this._drawIsland(x, y);
+    else if (this.style === 'cloud')  this._drawCloud(x, y);
+    else                               this._drawThin(x, y);
+  }
+
+  _drawIsland(sx, sy) {
+    const { w, h } = this;
+
+    // Dangling roots
+    ctx.strokeStyle = '#78350f';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    let rx = sx + 12;
+    let ri = 0;
+    while (rx < sx + w - 12) {
+      const rl = 14 + ((this._seed * 100 + ri * 17) % 18);
+      ctx.beginPath();
+      ctx.moveTo(rx, sy + h);
+      ctx.bezierCurveTo(rx - 4, sy + h + rl * 0.5, rx + 4, sy + h + rl * 0.7, rx, sy + h + rl);
+      ctx.stroke();
+      rx += 18 + ((ri * 7) % 9);
+      ri++;
+    }
+
+    // Dirt body
+    ctx.fillStyle = '#a16207';
+    ctx.roundRect(sx, sy + 14, w, h - 14, [0, 0, 6, 6]);
+    ctx.fill();
+
+    // Soil stripe
+    ctx.fillStyle = '#92400e';
+    ctx.fillRect(sx, sy + 14, w, 6);
+
+    // Grass top
+    const gGrad = ctx.createLinearGradient(sx, sy, sx, sy + 18);
+    gGrad.addColorStop(0, '#a3e635');
+    gGrad.addColorStop(1, '#4ade80');
+    ctx.fillStyle = gGrad;
+    ctx.roundRect(sx, sy + 2, w, 16, 7);
+    ctx.fill();
+
+    // Grass bumps
+    ctx.fillStyle = '#86efac';
+    for (let bx = sx + 8; bx < sx + w - 8; bx += 16) {
+      ctx.beginPath();
+      ctx.arc(bx, sy + 5, 7, Math.PI, 0);
+      ctx.fill();
+    }
+
+    // Decorations: flowers & mushrooms
+    const decCount = Math.max(1, Math.floor(w / 90));
+    for (let i = 0; i < decCount; i++) {
+      const seed2 = this._seed * 1000 + i * 37;
+      const fx = sx + 28 + i * Math.floor((w - 56) / Math.max(decCount, 1))
+               + (seed2 % 20) - 10;
+      if ((Math.floor(seed2) % 2) === 0) {
+        // Flower
+        const petal = ['#f87171','#fb923c','#facc15','#a78bfa','#f9a8d4'][Math.floor(seed2) % 5];
+        for (let p = 0; p < 5; p++) {
+          ctx.fillStyle = petal;
+          const pa = (p / 5) * Math.PI * 2;
+          ctx.beginPath();
+          ctx.arc(fx + Math.cos(pa) * 4, sy + Math.sin(pa) * 3, 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.fillStyle = '#fef08a';
+        ctx.beginPath(); ctx.arc(fx, sy, 3.5, 0, Math.PI * 2); ctx.fill();
+      } else {
+        // Mushroom
+        ctx.fillStyle = '#ef4444';
+        ctx.beginPath(); ctx.arc(fx, sy - 2, 5.5, Math.PI, 0); ctx.fill();
+        ctx.fillStyle = '#991b1b';
+        ctx.fillRect(fx - 2.5, sy - 2, 5, 7);
+        ctx.fillStyle = 'rgba(255,255,255,0.9)';
+        ctx.beginPath(); ctx.arc(fx - 2, sy - 4, 1.5, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(fx + 2, sy - 2, 1, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+  }
+
+  _drawCloud(sx, sy) {
+    const { w, h } = this;
+    const cx = sx + w / 2;
+    const cy = sy + h * 0.45;
+    const r  = h * 0.55;
+
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    // Bottom fill (solid rectangle base so character stands on flat surface)
+    ctx.fillRect(sx, cy, w, h - (cy - sy));
+
+    // Puff circles
+    const puffs = [
+      [cx,         cy, r * 1.15],
+      [cx - w * 0.27, cy + 2, r * 0.9],
+      [cx + w * 0.27, cy + 2, r * 0.9],
+      [cx - w * 0.12, cy - r * 0.45, r * 0.75],
+      [cx + w * 0.14, cy - r * 0.38, r * 0.65],
+    ];
+    for (const [px, py, pr] of puffs) {
+      ctx.beginPath();
+      ctx.arc(px, py, pr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Sheen
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.beginPath();
+    ctx.arc(cx - w * 0.12, cy - r * 0.4, r * 0.32, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  _drawThin(sx, sy) {
+    // Thin magical platform (glowing crystal)
+    const grad = ctx.createLinearGradient(sx, sy, sx + this.w, sy);
+    grad.addColorStop(0,   '#6d28d9');
+    grad.addColorStop(0.5, '#a78bfa');
+    grad.addColorStop(1,   '#6d28d9');
+    ctx.fillStyle = grad;
+    ctx.roundRect(sx, sy, this.w, this.h, 5);
+    ctx.fill();
+    ctx.strokeStyle = '#c4b5fd';
+    ctx.lineWidth = 1.5;
+    ctx.roundRect(sx, sy, this.w, this.h, 5);
+    ctx.stroke();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PLAYER
+//  character: 'penelope' | 'parker'
+//  Future: add health, mana, collectibles, shooting here
+// ═══════════════════════════════════════════════════════════════
+class Player {
+  constructor(x, y, character = 'penelope') {
+    this.x = x; this.y = y;
+    this.w = 32; this.h = 42;
+    this.vx = 0; this.vy = 0;
+    this.character = character;
+    this.onGround = false;
+    this.facingRight = true;
+    this.jumpHeld = false;
+    this.state = 'idle';      // 'idle' | 'run' | 'jump' | 'fall'
+    this.animFrame = 0;
+    this.animTick  = 0;
+    this.wingPhase = 0;       // for Parker's fairy wings
+    this.dustTimer = 0;
+  }
+
+  update(platforms) {
+    // ── Horizontal input ──────────────────────────────────────
+    if (Input.left()) {
+      this.vx = -CFG.MOVE_SPEED;
+      this.facingRight = false;
+    } else if (Input.right()) {
+      this.vx =  CFG.MOVE_SPEED;
+      this.facingRight = true;
+    } else {
+      this.vx *= CFG.FRICTION;
+    }
+
+    // ── Jump ─────────────────────────────────────────────────
+    const jumpKey = Input.jump();
+    if (jumpKey && this.onGround && !this.jumpHeld) {
+      this.vy = CFG.JUMP_FORCE;
+      this.onGround = false;
+      this.jumpHeld = true;
+      Particles.spawn(this.x + this.w / 2, this.y + this.h, {
+        count: 10, color: this._accentColor(), star: true, size: 5, rise: 4,
+      });
+    }
+    if (!jumpKey) this.jumpHeld = false;
+
+    // ── Gravity ───────────────────────────────────────────────
+    this.vy = Math.min(this.vy + CFG.GRAVITY, CFG.TERMINAL_VEL);
+
+    // ── Move & collide X ──────────────────────────────────────
+    this.x += this.vx;
+    this.x = Math.max(0, Math.min(this.x, CFG.WORLD_W - this.w));
+    this._resolveX(platforms);
+
+    // ── Move & collide Y ──────────────────────────────────────
+    const wasOnGround = this.onGround;
+    this.onGround = false;
+    this.y += this.vy;
+    this._resolveY(platforms);
+
+    // Landing burst
+    if (!wasOnGround && this.onGround) {
+      Particles.spawn(this.x + this.w / 2, this.y + this.h, {
+        count: 8, color: this._accentColor(), spread: 5, rise: 1.5, gravity: 0.12,
+      });
+    }
+
+    // ── Respawn if fallen ────────────────────────────────────
+    if (this.y > CFG.WORLD_H + 120) {
+      this.x = 160; this.y = 490; this.vx = 0; this.vy = 0;
+    }
+
+    // ── State & animation ────────────────────────────────────
+    if (!this.onGround)              this.state = this.vy < 0 ? 'jump' : 'fall';
+    else if (Math.abs(this.vx) > 0.4) this.state = 'run';
+    else                              this.state = 'idle';
+
+    this.animTick++;
+    if (this.state === 'run' && this.animTick % 7 === 0)
+      this.animFrame = (this.animFrame + 1) % 6;
+    if (this.state !== 'run') this.animFrame = 0;
+
+    this.wingPhase += 0.12;
+
+    // Running dust
+    if (this.state === 'run' && this.onGround) {
+      this.dustTimer++;
+      if (this.dustTimer % 8 === 0) {
+        Particles.spawn(this.x + this.w / 2, this.y + this.h, {
+          count: 2, color: 'rgba(200,200,255,0.7)', size: 3, rise: 0.5,
+          spread: 1.5, decay: 0.04, gravity: -0.01,
+        });
+      }
+    }
+  }
+
+  _resolveX(platforms) {
+    for (const p of platforms) {
+      if (p.overlaps(this.x, this.y + 2, this.w, this.h - 4)) {
+        if (this.vx > 0) this.x = p.x - this.w;
+        else             this.x = p.x + p.w;
+        this.vx = 0;
+      }
+    }
+  }
+
+  _resolveY(platforms) {
+    for (const p of platforms) {
+      if (p.overlaps(this.x + 2, this.y, this.w - 4, this.h)) {
+        if (this.vy >= 0) {
+          this.y = p.y - this.h;
+          this.onGround = true;
+        } else {
+          this.y = p.y + p.h;
+        }
+        this.vy = 0;
+      }
+    }
+  }
+
+  _accentColor() {
+    return this.character === 'penelope' ? '#c084fc' : '#67e8f9';
+  }
+
+  draw() {
+    const s = Camera.toScreen(this.x, this.y);
+    ctx.save();
+    if (!this.facingRight) {
+      ctx.translate(s.x + this.w, s.y);
+      ctx.scale(-1, 1);
+      this._drawChar(0, 0);
+    } else {
+      this._drawChar(s.x, s.y);
+    }
+    ctx.restore();
+  }
+
+  _drawChar(ox, oy) {
+    const { w, h } = this;
+    // Squish/stretch on jump/fall
+    const sq = this.state === 'jump' ? { sx: 0.82, sy: 1.18 }
+             : this.state === 'fall' ? { sx: 1.12, sy: 0.88 }
+             :                         { sx: 1,    sy: 1    };
+    // Head bob on run
+    const bob = this.state === 'run' ? Math.sin(this.animFrame * Math.PI / 3) * 2.5 : 0;
+
+    ctx.save();
+    ctx.translate(ox + w / 2, oy + h / 2 + bob);
+    ctx.scale(sq.sx, sq.sy);
+
+    if (this.character === 'penelope') this._drawPenelope(-w/2, -h/2, w, h);
+    else                               this._drawParker(-w/2, -h/2, w, h);
+
+    ctx.restore();
+  }
+
+  // ── Penelope: Magic Elf ───────────────────────────────────
+  _drawPenelope(x, y, w, h) {
+    const af = this.animFrame;
+    const armSwing = this.state === 'run' ? Math.sin(af * Math.PI / 3) * 14 : 0;
+    const legSwing = this.state === 'run' ? Math.sin(af * Math.PI / 3) * 9  : 0;
+
+    // Legs
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#6d28d9'; ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(x + w/2 - 5, y + h - 10);
+    ctx.lineTo(x + w/2 - 5, y + h + 1 + legSwing * 0.5);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + w/2 + 5, y + h - 10);
+    ctx.lineTo(x + w/2 + 5, y + h + 1 - legSwing * 0.5);
+    ctx.stroke();
+
+    // Boots
+    ctx.fillStyle = '#4c1d95';
+    ctx.beginPath(); ctx.ellipse(x + w/2 - 5, y + h + 1 + legSwing*0.5, 5, 3, 0, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + w/2 + 5, y + h + 1 - legSwing*0.5, 5, 3, 0, 0, Math.PI*2); ctx.fill();
+
+    // Body (lavender tunic)
+    const bodyGrad = ctx.createLinearGradient(x + 5, y + 16, x + w - 5, y + h - 10);
+    bodyGrad.addColorStop(0, '#a78bfa');
+    bodyGrad.addColorStop(1, '#7c3aed');
+    ctx.fillStyle = bodyGrad;
+    ctx.roundRect(x + 5, y + 16, w - 10, h - 26, 5);
+    ctx.fill();
+
+    // Skirt
+    ctx.fillStyle = '#c4b5fd';
+    ctx.beginPath();
+    ctx.ellipse(x + w/2, y + h - 12, w/2 - 1, 9, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Belt
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillRect(x + 5, y + h - 22, w - 10, 4);
+    ctx.fillStyle = '#f59e0b';
+    ctx.beginPath(); ctx.arc(x + w/2, y + h - 20, 4, 0, Math.PI * 2); ctx.fill();
+
+    // Arms
+    ctx.strokeStyle = '#fde68a'; ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(x + 7, y + 21);
+    ctx.lineTo(x + 1, y + 31 + armSwing * 0.35);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + w - 7, y + 21);
+    ctx.lineTo(x + w - 1, y + 31 - armSwing * 0.35);
+    ctx.stroke();
+
+    // Wand in right hand
+    ctx.strokeStyle = '#f0abfc'; ctx.lineWidth = 2;
+    const wx = x + w - 1, wy = y + 31 - armSwing * 0.35;
+    ctx.beginPath();
+    ctx.moveTo(wx, wy);
+    ctx.lineTo(wx + 10, wy - 10);
+    ctx.stroke();
+    drawStar(ctx, wx + 10, wy - 12, 5, 5, '#fbbf24');
+
+    // Head
+    ctx.fillStyle = '#fde68a';
+    ctx.beginPath(); ctx.arc(x + w/2, y + 12, 12, 0, Math.PI * 2); ctx.fill();
+
+    // Pointed elf ears
+    ctx.fillStyle = '#fde68a';
+    ctx.beginPath();
+    ctx.moveTo(x + 6, y + 11); ctx.lineTo(x - 3, y + 4); ctx.lineTo(x + 9, y + 15);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x + w - 6, y + 11); ctx.lineTo(x + w + 3, y + 4); ctx.lineTo(x + w - 9, y + 15);
+    ctx.fill();
+    // Ear line
+    ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x + 6, y + 11); ctx.lineTo(x - 3, y + 4); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x + w - 6, y + 11); ctx.lineTo(x + w + 3, y + 4); ctx.stroke();
+
+    // Hair (green elf style)
+    ctx.fillStyle = '#4ade80';
+    ctx.beginPath(); ctx.arc(x + w/2, y + 5, 12, Math.PI, 0); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + w/2 - 7, y + 2, 7, Math.PI * 1.1, Math.PI * 1.9); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + w/2 + 7, y + 2, 7, Math.PI * 1.1, Math.PI * 1.9); ctx.fill();
+
+    // Elf hat
+    ctx.fillStyle = '#7c3aed';
+    ctx.beginPath();
+    ctx.moveTo(x + w/2, y - 12);
+    ctx.lineTo(x + w/2 - 11, y + 3);
+    ctx.lineTo(x + w/2 + 11, y + 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#a78bfa';
+    ctx.beginPath();
+    ctx.ellipse(x + w/2, y + 3, 11, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    drawStar(ctx, x + w/2, y - 14, 5, 5, '#fbbf24');
+
+    // Eyes
+    ctx.fillStyle = '#312e81';
+    ctx.beginPath(); ctx.arc(x + w/2 - 4, y + 12, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + w/2 + 4, y + 12, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(x + w/2 - 3, y + 11, 0.9, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + w/2 + 5, y + 11, 0.9, 0, Math.PI * 2); ctx.fill();
+
+    // Smile
+    ctx.strokeStyle = '#92400e'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(x + w/2, y + 15, 4, 0.15, Math.PI - 0.15); ctx.stroke();
+
+    // Rosy cheeks
+    ctx.fillStyle = 'rgba(251, 113, 133, 0.3)';
+    ctx.beginPath(); ctx.ellipse(x + w/2 - 7, y + 15, 4, 3, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + w/2 + 7, y + 15, 4, 3, 0, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // ── Parker: Magical Fairy ─────────────────────────────────
+  _drawParker(x, y, w, h) {
+    const af = this.animFrame;
+    const wp = this.wingPhase;
+    const armSwing = this.state === 'run' ? Math.sin(af * Math.PI / 3) * 14 : 0;
+    const legSwing = this.state === 'run' ? Math.sin(af * Math.PI / 3) * 9  : 0;
+    const flapAmt  = this.state === 'jump' || this.state === 'fall'
+                     ? Math.sin(wp * 3) * 6 : Math.sin(wp) * 3;
+
+    // Wings (drawn behind body)
+    ctx.globalAlpha = 0.75;
+    // Upper wings
+    ctx.fillStyle = '#bfdbfe';
+    ctx.beginPath();
+    ctx.ellipse(x + 5, y + 18 + flapAmt, 13, 8, -0.45, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(x + w - 5, y + 18 + flapAmt, 13, 8, 0.45, 0, Math.PI * 2);
+    ctx.fill();
+    // Lower wings
+    ctx.fillStyle = '#e9d5ff';
+    ctx.beginPath();
+    ctx.ellipse(x + 5, y + 28 - flapAmt * 0.5, 10, 6, 0.3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(x + w - 5, y + 28 - flapAmt * 0.5, 10, 6, -0.3, 0, Math.PI * 2);
+    ctx.fill();
+    // Wing shimmer
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.beginPath(); ctx.ellipse(x + 4, y + 16 + flapAmt, 4, 3, -0.45, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + w - 4, y + 16 + flapAmt, 4, 3, 0.45, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Legs
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#db2777'; ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(x + w/2 - 5, y + h - 12);
+    ctx.lineTo(x + w/2 - 5, y + h + legSwing * 0.5);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + w/2 + 5, y + h - 12);
+    ctx.lineTo(x + w/2 + 5, y + h - legSwing * 0.5);
+    ctx.stroke();
+
+    // Shoes (curled fairy slippers)
+    ctx.fillStyle = '#be185d';
+    ctx.beginPath(); ctx.ellipse(x + w/2 - 5, y + h + legSwing*0.5, 5.5, 3, 0.2, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + w/2 + 5, y + h - legSwing*0.5, 5.5, 3, -0.2, 0, Math.PI*2); ctx.fill();
+
+    // Body
+    const bodyGrad = ctx.createLinearGradient(x + 5, y + 16, x + w - 5, y + h - 10);
+    bodyGrad.addColorStop(0, '#f9a8d4');
+    bodyGrad.addColorStop(1, '#ec4899');
+    ctx.fillStyle = bodyGrad;
+    ctx.roundRect(x + 5, y + 16, w - 10, h - 26, 5);
+    ctx.fill();
+
+    // Tutu skirt
+    ctx.fillStyle = 'rgba(251,207,232,0.9)';
+    ctx.beginPath();
+    ctx.ellipse(x + w/2, y + h - 13, w/2, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Tutu ruffles
+    ctx.strokeStyle = '#fbcfe8'; ctx.lineWidth = 2;
+    for (let i = 0; i < 5; i++) {
+      const ra = (i / 5) * Math.PI;
+      ctx.beginPath();
+      ctx.arc(x + w/2 + Math.cos(ra) * 10, y + h - 13, 4, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Arms
+    ctx.strokeStyle = '#fed7aa'; ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(x + 7, y + 21);
+    ctx.lineTo(x + 1, y + 31 + armSwing * 0.35);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + w - 7, y + 21);
+    ctx.lineTo(x + w - 1, y + 31 - armSwing * 0.35);
+    ctx.stroke();
+
+    // Fairy dust trail from hand
+    for (let i = 0; i < 3; i++) {
+      ctx.fillStyle = `rgba(251,191,36,${0.7 - i * 0.2})`;
+      ctx.beginPath();
+      ctx.arc(x + w - 1 - i * 4, y + 31 - armSwing * 0.35 + Math.sin(i * 1.5) * 3, 2.5 - i * 0.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Head
+    ctx.fillStyle = '#fed7aa';
+    ctx.beginPath(); ctx.arc(x + w/2, y + 12, 12, 0, Math.PI * 2); ctx.fill();
+
+    // Hair (golden, wavy)
+    ctx.fillStyle = '#fbbf24';
+    ctx.beginPath(); ctx.arc(x + w/2, y + 5, 12, Math.PI, 0); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + w/2 - 11, y + 16, 4, 9, -0.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + w/2 + 11, y + 16, 4, 9, 0.2, 0, Math.PI * 2); ctx.fill();
+
+    // Flower crown
+    const flowerPalette = ['#f87171','#fb923c','#facc15','#4ade80','#60a5fa','#f9a8d4'];
+    for (let i = 0; i < 6; i++) {
+      const fa = (i / 6) * Math.PI * 2;
+      ctx.fillStyle = flowerPalette[i];
+      ctx.beginPath();
+      ctx.arc(x + w/2 + Math.cos(fa) * 10, y + 2 + Math.sin(fa) * 5, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#fef08a';
+    ctx.beginPath(); ctx.arc(x + w/2, y + 2, 3.5, 0, Math.PI * 2); ctx.fill();
+
+    // Eyes
+    ctx.fillStyle = '#1e3a5f';
+    ctx.beginPath(); ctx.arc(x + w/2 - 4, y + 12, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + w/2 + 4, y + 12, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(x + w/2 - 3, y + 11, 0.9, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + w/2 + 5, y + 11, 0.9, 0, Math.PI * 2); ctx.fill();
+
+    // Eyelashes (cute)
+    ctx.strokeStyle = '#1e3a5f'; ctx.lineWidth = 1;
+    for (let e = -1; e <= 1; e++) {
+      ctx.beginPath();
+      ctx.moveTo(x + w/2 - 4 + e * 1.5, y + 10);
+      ctx.lineTo(x + w/2 - 4 + e * 1.5, y + 8);
+      ctx.stroke();
+    }
+
+    // Smile
+    ctx.strokeStyle = '#9a3412'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(x + w/2, y + 15, 4, 0.15, Math.PI - 0.15); ctx.stroke();
+
+    // Rosy cheeks
+    ctx.fillStyle = 'rgba(244, 114, 182, 0.35)';
+    ctx.beginPath(); ctx.ellipse(x + w/2 - 7, y + 15, 4.5, 3, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + w/2 + 7, y + 15, 4.5, 3, 0, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  BACKGROUND  (sky, parallax clouds, stars)
+// ═══════════════════════════════════════════════════════════════
+const BG = (() => {
+  // Generate background cloud data once
+  const bgClouds = Array.from({ length: 35 }, (_, i) => ({
+    x:     (i * 997 % CFG.WORLD_W),
+    y:     (i * 331 % 550) + 20,
+    w:     (i * 157 % 180) + 70,
+    h:     (i * 83  % 50)  + 28,
+    speed: (i * 13  % 30)  * 0.01 + 0.04,
+    alpha: (i * 71  % 35)  * 0.01 + 0.12,
+  }));
+
+  function update() {
+    for (const c of bgClouds) {
+      c.x += c.speed;
+      if (c.x > CFG.WORLD_W + 200) c.x = -200;
+    }
+  }
+
+  function draw() {
+    // Sky gradient
+    const sg = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    sg.addColorStop(0,    '#7dd3fc');
+    sg.addColorStop(0.45, '#bae6fd');
+    sg.addColorStop(1,    '#e0f2fe');
+    ctx.fillStyle = sg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Distant sparkle stars
+    const t = Date.now() * 0.0008;
+    for (let i = 0; i < 25; i++) {
+      const sx = ((i * 317 + 30) % CFG.WORLD_W) - Camera.x * 0.04;
+      const sy = (i * 173 % 350) - Camera.y * 0.04;
+      if (sx < -8 || sx > canvas.width + 8 || sy < -8 || sy > canvas.height + 8) continue;
+      const pulse = (Math.sin(t * 1.8 + i * 1.3) + 1) * 0.5;
+      ctx.globalAlpha = 0.2 + pulse * 0.5;
+      ctx.fillStyle = i % 3 === 0 ? '#fde68a' : '#c7d2fe';
+      ctx.beginPath(); ctx.arc(sx, sy, 1.5 + pulse * 1.2, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Parallax background clouds
+    for (const c of bgClouds) {
+      const sx = c.x - Camera.x * 0.28;
+      const sy = c.y - Camera.y * 0.08;
+      if (sx + c.w < -60 || sx > canvas.width + 60) continue;
+      const cx2 = sx + c.w / 2;
+      const cy2 = sy + c.h / 2;
+      const r   = c.h * 0.52;
+
+      ctx.globalAlpha = c.alpha;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(cx2, cy2, r * 1.1, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx2 - c.w * 0.26, cy2 + 2, r * 0.85, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx2 + c.w * 0.26, cy2 + 2, r * 0.85, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx2 - c.w * 0.1, cy2 - r * 0.4, r * 0.7, 0, Math.PI * 2); ctx.fill();
+      ctx.fillRect(sx + c.w * 0.15, cy2, c.w * 0.7, r + 3);
+    }
+    ctx.globalAlpha = 1;
+
+    // Distant rainbow (decorative)
+    const ry = canvas.height * 0.6 - Camera.y * 0.05;
+    const rx = canvas.width * 0.5 - Camera.x * 0.02;
+    const rainbowColors = ['rgba(239,68,68,0.15)','rgba(251,146,60,0.12)','rgba(250,204,21,0.12)',
+                            'rgba(74,222,128,0.12)','rgba(96,165,250,0.12)','rgba(167,139,250,0.12)'];
+    for (let rb = 0; rb < rainbowColors.length; rb++) {
+      ctx.strokeStyle = rainbowColors[rb];
+      ctx.lineWidth = 10;
+      ctx.beginPath();
+      ctx.arc(rx, ry + 60, 200 + rb * 14, Math.PI, 0);
+      ctx.stroke();
+    }
+  }
+
+  return { update, draw };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  WORLD  (platform layout for Sky Island World)
+// ═══════════════════════════════════════════════════════════════
+function buildSkyIslandWorld() {
+  return [
+    // Starting island
+    new Platform(80,  550, 320, 44, 'island'),
+
+    // Early stepping stones
+    new Platform(460, 490, 100, 30, 'cloud'),
+    new Platform(620, 440, 100, 30, 'cloud'),
+    new Platform(780, 380, 80,  28, 'thin'),
+
+    // First big sky island
+    new Platform(920, 460, 260, 44, 'island'),
+
+    // Ascending cloud path
+    new Platform(1240, 410, 90, 28, 'cloud'),
+    new Platform(1390, 360, 90, 28, 'cloud'),
+
+    // Mid island
+    new Platform(1540, 330, 220, 44, 'island'),
+
+    // High section
+    new Platform(1820, 260, 80,  26, 'thin'),
+    new Platform(1960, 310, 110, 30, 'cloud'),
+    new Platform(2110, 250, 80,  26, 'thin'),
+
+    // Wide flower island
+    new Platform(2260, 360, 300, 44, 'island'),
+
+    // Descending crystal platforms
+    new Platform(2620, 420, 80, 26, 'thin'),
+    new Platform(2760, 390, 80, 26, 'thin'),
+    new Platform(2900, 360, 80, 26, 'thin'),
+
+    // Cloud section
+    new Platform(3040, 330, 110, 30, 'cloud'),
+    new Platform(3200, 290, 110, 30, 'cloud'),
+
+    // Grand central island
+    new Platform(3360, 370, 360, 48, 'island'),
+
+    // Upper sky leap
+    new Platform(3780, 270, 80,  26, 'thin'),
+    new Platform(3920, 230, 130, 30, 'cloud'),
+    new Platform(4100, 300, 80,  26, 'thin'),
+
+    // Final island (boss area placeholder)
+    new Platform(4240, 360, 420, 50, 'island'),
+
+    // Low cloud safety nets
+    new Platform(340,  620, 80,  26, 'cloud'),
+    new Platform(810,  570, 80,  26, 'cloud'),
+    new Platform(1140, 560, 80,  26, 'cloud'),
+    new Platform(2180, 510, 80,  26, 'cloud'),
+    new Platform(3000, 520, 80,  26, 'cloud'),
+  ];
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  HUD
+// ═══════════════════════════════════════════════════════════════
+function drawHUD(player) {
+  // Character badge (top-left)
+  ctx.fillStyle = 'rgba(0,0,0,0.38)';
+  ctx.roundRect(10, 10, 220, 38, 8);
+  ctx.fill();
+
+  const isPen = player.character === 'penelope';
+  ctx.fillStyle = isPen ? '#c084fc' : '#67e8f9';
+  ctx.font = 'bold 13px Georgia';
+  ctx.fillText(isPen ? '✨ Penelope  —  Magic Elf'
+                     : '🧚 Parker  —  Magical Fairy', 18, 33);
+
+  // Tab / switch hint (top-right)
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '11px Georgia';
+  ctx.textAlign = 'right';
+  ctx.fillText(IS_TOUCH ? 'Tab: switch character' : '[Tab] switch character',
+               canvas.width - 10, 26);
+  ctx.textAlign = 'left';
+
+  // Keyboard controls bar — only shown on non-touch devices
+  if (!IS_TOUCH) {
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.roundRect(10, canvas.height - 26, 400, 18, 5);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.font = '10px Georgia';
+    ctx.fillText('← → / A D  Move     ↑ / W  Jump     Space  Shoot', 16, canvas.height - 13);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GAME INIT & LOOP
+// ═══════════════════════════════════════════════════════════════
+const platforms = buildSkyIslandWorld();
+let activeChar = 'penelope';
+let player = new Player(160, 490, activeChar);
+
+// Switch character with Tab
+window.addEventListener('keydown', e => {
+  if (e.code === 'Tab') {
+    e.preventDefault();
+    activeChar = activeChar === 'penelope' ? 'parker' : 'penelope';
+    const np = new Player(player.x, player.y, activeChar);
+    np.vx = player.vx;
+    np.vy = -4;   // little pop on switch
+    player = np;
+    Particles.spawn(player.x + player.w / 2, player.y + player.h / 2, {
+      count: 14, color: activeChar === 'penelope' ? '#c084fc' : '#67e8f9',
+      spread: 5, rise: 4, star: true, size: 6, decay: 0.02,
+    });
+  }
+});
+
+function gameLoop() {
+  // ── Update ──────────────────────────────────────────────────
+  player.update(platforms);
+  Camera.update(player);
+  BG.update();
+  Particles.update();
+
+  // Shoot: touch button OR Z key on keyboard
+  if (TouchControls.consumeShoot() || Input.wasPressed('Space')) {
+    shootAction(player);
+  }
+
+  Input.clearFrame();
+
+  // ── Draw ────────────────────────────────────────────────────
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  BG.draw();
+  for (const p of platforms) p.draw();
+  Particles.draw();
+  player.draw();
+  drawHUD(player);
+  TouchControls.draw();   // on-screen buttons (touch devices only)
+
+  requestAnimationFrame(gameLoop);
+}
+
+// Snap camera to player position before first frame
+Camera.x = player.x + player.w / 2 - Camera.W / 2;
+Camera.y = player.y + player.h / 2 - Camera.H * 0.52;
+Camera.x = Math.max(0, Math.min(Camera.x, CFG.WORLD_W - Camera.W));
+Camera.y = Math.max(0, Math.min(Camera.y, CFG.WORLD_H - Camera.H));
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
