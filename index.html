@@ -66,15 +66,18 @@ const IS_TOUCH = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
 // ── Tunable constants ─────────────────────────────────────────
 const CFG = {
-  GRAVITY:         0.42,   // upward acceleration (while vy < 0)
-  FALL_GRAVITY:    0.22,   // gentler gravity while falling (vy >= 0)
-  JUMP_FORCE:     -11.5,
-  MOVE_SPEED:      4.8,
-  FRICTION:        0.76,   // horizontal deceleration when no key held
-  TERMINAL_VEL:    6.5,    // max fall speed (was 14 — lower = more graceful)
-  WORLD_W:        5000,
-  WORLD_H:        1000,
-  CAM_LERP:       0.09,
+  GRAVITY:          0.42,   // upward acceleration (while vy < 0)
+  FALL_GRAVITY:     0.22,   // gentler gravity while falling (vy >= 0)
+  JUMP_FORCE:      -11.5,
+  MOVE_SPEED:       4.8,
+  FRICTION:         0.76,   // horizontal deceleration when no key held
+  TERMINAL_VEL:     6.5,    // max fall speed (was 14 — lower = more graceful)
+  WORLD_W:         5000,
+  WORLD_H:         1000,
+  CAM_LERP:        0.09,
+  GROUND_Y:         900,    // top surface of ground floor
+  BOUNCE_FORCE:    -20,     // bounce flower launch velocity (normal jump is -11.5)
+  FLYTRAP_DELAY:    60,     // frames before flytrap snaps (1 second @ 60fps)
 };
 
 // ── roundRect: always call beginPath() first ──────────────────
@@ -1007,6 +1010,7 @@ class Platform {
     const { x, y } = Camera.toScreen(this.x, this.y);
     if      (this.style === 'island') this._drawIsland(x, y);
     else if (this.style === 'cloud')  this._drawCloud(x, y);
+    else if (this.style === 'ground') this._drawGround(x, y);
     else                               this._drawThin(x, y);
   }
 
@@ -1130,6 +1134,56 @@ class Platform {
     ctx.roundRect(sx, sy, this.w, this.h, 5);
     ctx.stroke();
   }
+
+  _drawGround(sx, sy) {
+    // Only paint the visible strip (ground spans the full world width)
+    const drawX = Math.max(sx, 0);
+    const drawW = Math.min(sx + this.w, canvas.width) - drawX;
+    if (drawW <= 0) return;
+
+    // Dirt body
+    const dg = ctx.createLinearGradient(drawX, sy + 16, drawX, sy + this.h);
+    dg.addColorStop(0,   '#a16207');
+    dg.addColorStop(0.3, '#92400e');
+    dg.addColorStop(1,   '#7c2d12');
+    ctx.fillStyle = dg;
+    ctx.fillRect(drawX, sy + 16, drawW, this.h - 16);
+
+    // Grass strip
+    const gg = ctx.createLinearGradient(drawX, sy, drawX, sy + 16);
+    gg.addColorStop(0, '#4ade80');
+    gg.addColorStop(1, '#16a34a');
+    ctx.fillStyle = gg;
+    ctx.fillRect(drawX, sy, drawW, 16);
+
+    // Rounded grass tufts along top edge
+    ctx.fillStyle = '#22c55e';
+    for (let tx = (drawX - sx) % 28 + drawX; tx < drawX + drawW; tx += 28) {
+      ctx.beginPath(); ctx.arc(tx, sy + 4, 6, Math.PI, 0); ctx.fill();
+    }
+
+    // Dirt specks (deterministic from world position)
+    ctx.fillStyle = 'rgba(100,38,0,0.35)';
+    for (let i = 0; i < 30; i++) {
+      const wx = drawX + Camera.x + (i * 317 + 7) % drawW;
+      const wy = sy + 20 + (i * 173 % (this.h - 24));
+      const { x: spx } = Camera.toScreen(wx, 0);
+      if (spx >= drawX && spx <= drawX + drawW) {
+        ctx.beginPath(); ctx.arc(spx, wy, 2.5, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // Small stones
+    ctx.fillStyle = '#78716c';
+    for (let i = 0; i < 12; i++) {
+      const wx = drawX + Camera.x + (i * 613 + 11) % drawW;
+      const wy = sy + 24 + (i * 251 % (this.h - 30));
+      const { x: spx } = Camera.toScreen(wx, 0);
+      if (spx >= drawX && spx <= drawX + drawW) {
+        ctx.beginPath(); ctx.ellipse(spx, wy, 5.5, 3, 0.4, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1232,6 +1286,7 @@ class Player {
 
   _resolveX(platforms) {
     for (const p of platforms) {
+      if (p.topOnly || p.passable) continue;
       if (p.overlaps(this.x, this.y + 2, this.w, this.h - 4)) {
         if (this.vx > 0) this.x = p.x - this.w;
         else             this.x = p.x + p.w;
@@ -1242,14 +1297,16 @@ class Player {
 
   _resolveY(platforms) {
     for (const p of platforms) {
+      if (p.passable) continue;
       if (p.overlaps(this.x + 2, this.y, this.w - 4, this.h)) {
         if (this.vy >= 0) {
           this.y = p.y - this.h;
           this.onGround = true;
-        } else {
+          this.vy = 0;
+        } else if (!p.topOnly) {
           this.y = p.y + p.h;
+          this.vy = 0;
         }
-        this.vy = 0;
       }
     }
   }
@@ -1427,6 +1484,244 @@ function buildSkyIslandWorld() {
     new Platform(1140, 560, 80,  26, 'cloud'),
     new Platform(2180, 510, 80,  26, 'cloud'),
     new Platform(3000, 520, 80,  26, 'cloud'),
+
+    // Ground floor
+    new Platform(0, CFG.GROUND_Y, CFG.WORLD_W, 100, 'ground'),
+  ];
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GROUND FLOWERS
+// ═══════════════════════════════════════════════════════════════
+
+class BounceFlower {
+  constructor(wx) {
+    this.wx   = wx;        // world X center
+    this.wy   = CFG.GROUND_Y; // sits on ground top
+    this.w    = 60;
+    this.h    = 70;
+    // Top hitbox used for landing detection (topOnly-style)
+    this.x    = wx - 30;
+    this.y    = CFG.GROUND_Y - 70;
+    this.topOnly = true;
+    this.passable = false;
+    this.squash   = 0;    // 0-1 squash amount, decays
+    this.sparkles = [];
+  }
+
+  overlaps(px, py, pw, ph) {
+    return px < this.x + this.w && px + pw > this.x &&
+           py < this.y + 8      && py + ph > this.y;
+  }
+
+  update(player) {
+    if (this.squash > 0) this.squash = Math.max(0, this.squash - 0.07);
+    // Sparkles age out
+    for (let i = this.sparkles.length - 1; i >= 0; i--) {
+      this.sparkles[i].life -= 1;
+      if (this.sparkles[i].life <= 0) this.sparkles.splice(i, 1);
+    }
+
+    // Check if player just landed on top (player feet near our top surface)
+    const onTop = player.vy >= 0 &&
+                  player.x + player.w > this.x + 4 &&
+                  player.x < this.x + this.w - 4 &&
+                  Math.abs((player.y + player.h) - this.y) < 10 &&
+                  player.onGround;
+    if (onTop) {
+      player.vy = CFG.BOUNCE_FORCE;
+      player.onGround = false;
+      this.squash = 1;
+      // Spawn sparkles
+      for (let i = 0; i < 8; i++) {
+        const ang = (Math.PI * 2 * i / 8) - Math.PI / 2;
+        this.sparkles.push({
+          x: this.wx, y: this.y,
+          vx: Math.cos(ang) * (1.5 + Math.random()),
+          vy: Math.sin(ang) * (1.5 + Math.random()) - 1,
+          life: 20 + Math.random() * 10,
+          color: ['#f9a8d4','#fde68a','#86efac','#c4b5fd'][i % 4],
+        });
+      }
+    }
+  }
+
+  draw() {
+    if (!Camera.inView(this.x - 10, this.y - 10, this.w + 20, this.h + 20)) return;
+    const sc = this.squash;
+    const sx = Camera.toScreen(this.wx, 0).x;
+    const groundSY = Camera.toScreen(0, CFG.GROUND_Y).y;
+
+    // Stem (squash: shorter + wider)
+    const stemH = (this.h - 30) * (1 - sc * 0.3);
+    const stemW = 10 * (1 + sc * 0.5);
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(sx - stemW / 2, groundSY - stemH, stemW, stemH);
+
+    // Head center (squash: wider + shorter)
+    const headR  = 24 * (1 + sc * 0.3);
+    const headCY = groundSY - stemH - headR * (1 - sc * 0.25);
+
+    // Petals (8 petals, pink)
+    ctx.fillStyle = '#f9a8d4';
+    for (let i = 0; i < 8; i++) {
+      const ang = (Math.PI * 2 * i / 8);
+      const px = sx + Math.cos(ang) * headR * 1.1;
+      const py = headCY + Math.sin(ang) * headR * 1.1;
+      ctx.beginPath(); ctx.ellipse(px, py, 10, 7, ang, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Face disk
+    const dg = ctx.createRadialGradient(sx, headCY, 2, sx, headCY, headR);
+    dg.addColorStop(0, '#fef08a'); dg.addColorStop(1, '#facc15');
+    ctx.fillStyle = dg;
+    ctx.beginPath(); ctx.arc(sx, headCY, headR, 0, Math.PI * 2); ctx.fill();
+
+    // Smile
+    ctx.strokeStyle = '#92400e'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sx, headCY + 2, headR * 0.45, 0.2, Math.PI - 0.2); ctx.stroke();
+    // Eyes
+    ctx.fillStyle = '#1e3a1e';
+    ctx.beginPath(); ctx.arc(sx - headR * 0.3, headCY - headR * 0.1, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx + headR * 0.3, headCY - headR * 0.1, 2.5, 0, Math.PI * 2); ctx.fill();
+
+    // Sparkles
+    for (const sp of this.sparkles) {
+      const spsc = Camera.toScreen(sp.x, sp.y);
+      ctx.globalAlpha = sp.life / 30;
+      ctx.fillStyle = sp.color;
+      ctx.beginPath(); ctx.arc(spsc.x + sp.vx * (30 - sp.life), spsc.y + sp.vy * (30 - sp.life), 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+class FlytrapFlower {
+  constructor(wx) {
+    this.wx   = wx;
+    this.wy   = CFG.GROUND_Y;
+    this.w    = 60;
+    this.h    = 70;
+    this.x    = wx - 30;
+    this.y    = CFG.GROUND_Y - 70;
+    this.topOnly  = true;
+    this.passable = false;
+
+    this.state     = 'open';    // 'open' | 'countdown' | 'closed' | 'reopening'
+    this.closeAmt  = 0;         // 0=open mouth, 1=closed
+    this.timer     = 0;
+    this.flashOn   = false;
+  }
+
+  overlaps(px, py, pw, ph) {
+    if (this.passable) return false;
+    return px < this.x + this.w && px + pw > this.x &&
+           py < this.y + 8      && py + ph > this.y;
+  }
+
+  update(player) {
+    const onTop = player.vy >= 0 &&
+                  player.x + player.w > this.x + 6 &&
+                  player.x < this.x + this.w - 6 &&
+                  Math.abs((player.y + player.h) - this.y) < 10 &&
+                  player.onGround;
+
+    if (this.state === 'open') {
+      this.closeAmt = 0;
+      if (onTop) { this.state = 'countdown'; this.timer = CFG.FLYTRAP_DELAY; }
+
+    } else if (this.state === 'countdown') {
+      this.timer--;
+      this.closeAmt = 1 - (this.timer / CFG.FLYTRAP_DELAY);
+      this.flashOn = this.timer < 30 && Math.floor(this.timer / 5) % 2 === 0;
+      if (!onTop) {
+        // Player escaped — reopen
+        this.state = 'open'; this.closeAmt = 0; this.flashOn = false;
+      } else if (this.timer <= 0) {
+        // Snap!
+        this.state = 'closed'; this.timer = 90; this.closeAmt = 1;
+        this.passable = true;
+        // Kill player: poof
+        Particles.spawn(player.x + player.w / 2, player.y + player.h / 2, 20, '#f87171', 4);
+        player.x = 160; player.y = 490; player.vx = 0; player.vy = 0; player.onGround = false;
+      }
+
+    } else if (this.state === 'closed') {
+      this.timer--;
+      if (this.timer <= 0) { this.state = 'reopening'; this.timer = 30; this.passable = false; }
+
+    } else if (this.state === 'reopening') {
+      this.timer--;
+      this.closeAmt = this.timer / 30;
+      if (this.timer <= 0) { this.state = 'open'; this.closeAmt = 0; }
+    }
+  }
+
+  draw() {
+    if (!Camera.inView(this.x - 10, this.y - 10, this.w + 20, this.h + 20)) return;
+    const sx    = Camera.toScreen(this.wx, 0).x;
+    const groundSY = Camera.toScreen(0, CFG.GROUND_Y).y;
+
+    // Spotted stem
+    const stemH = this.h - 30;
+    ctx.fillStyle = '#4ade80';
+    ctx.fillRect(sx - 6, groundSY - stemH, 12, stemH);
+    ctx.fillStyle = 'rgba(0,100,0,0.3)';
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath();
+      ctx.arc(sx + (i % 2 === 0 ? -3 : 3), groundSY - stemH * (0.2 + i * 0.2), 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Head: two jaws
+    const headCY  = groundSY - stemH - 18;
+    const openAng = (1 - this.closeAmt) * 0.55; // max ~31° open gap each jaw
+    const flash   = this.flashOn ? 1 : 0;
+    const headCol = flash ? '#ff6b6b' : '#a855f7';
+
+    // Bottom jaw
+    ctx.fillStyle = headCol;
+    ctx.save();
+    ctx.translate(sx, headCY);
+    ctx.rotate(openAng);
+    ctx.beginPath();
+    ctx.ellipse(0, 10, 28, 16, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Teeth bottom
+    ctx.fillStyle = '#fff';
+    for (let i = -2; i <= 2; i++) {
+      ctx.beginPath(); ctx.moveTo(i * 9 - 4, -2); ctx.lineTo(i * 9, -10); ctx.lineTo(i * 9 + 4, -2); ctx.fill();
+    }
+    ctx.restore();
+
+    // Top jaw
+    ctx.fillStyle = headCol;
+    ctx.save();
+    ctx.translate(sx, headCY);
+    ctx.rotate(-openAng);
+    ctx.beginPath();
+    ctx.ellipse(0, -10, 28, 16, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Teeth top
+    ctx.fillStyle = '#fff';
+    for (let i = -2; i <= 2; i++) {
+      ctx.beginPath(); ctx.moveTo(i * 9 - 4, 2); ctx.lineTo(i * 9, 10); ctx.lineTo(i * 9 + 4, 2); ctx.fill();
+    }
+    // Red mouth interior
+    if (this.closeAmt < 0.9) {
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath(); ctx.ellipse(0, 0, 20, 8 * (1 - this.closeAmt), 0, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+function buildGroundFlowers() {
+  const bounceXs  = [450, 1050, 1650, 2300, 2800, 3540, 4300];
+  const flytrapXs = [750, 1350, 2000, 2550, 3150, 3900];
+  return [
+    ...bounceXs.map(x  => new BounceFlower(x)),
+    ...flytrapXs.map(x => new FlytrapFlower(x)),
   ];
 }
 
@@ -1628,6 +1923,7 @@ const SelectScreen = (() => {
 //  GAME INIT & LOOP
 // ═══════════════════════════════════════════════════════════════
 const platforms = buildSkyIslandWorld();
+const flowers   = buildGroundFlowers();
 let gameState = 'select'; // 'select' | 'playing'
 let activeChar = 'penelope';
 let player = null;
@@ -1670,7 +1966,8 @@ function gameLoop() {
   }
 
   // ── Playing: Update ─────────────────────────────────────────
-  player.update(platforms);
+  player.update([...platforms, ...flowers]);
+  for (const f of flowers) f.update(player);
   Camera.update(player);
   BG.update();
   Particles.update();
@@ -1687,6 +1984,7 @@ function gameLoop() {
   // ── Playing: Draw ───────────────────────────────────────────
   BG.draw();
   for (const p of platforms) p.draw();
+  for (const f of flowers) f.draw();
   Particles.draw();
   for (const pr of projectiles) pr.draw();
   player.draw();
