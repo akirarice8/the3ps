@@ -66,18 +66,25 @@ const IS_TOUCH = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
 // ── Tunable constants ─────────────────────────────────────────
 const CFG = {
-  GRAVITY:          0.42,   // upward acceleration (while vy < 0)
-  FALL_GRAVITY:     0.22,   // gentler gravity while falling (vy >= 0)
-  JUMP_FORCE:      -11.5,
-  MOVE_SPEED:       4.8,
-  FRICTION:         0.76,   // horizontal deceleration when no key held
-  TERMINAL_VEL:     6.5,    // max fall speed (was 14 — lower = more graceful)
-  WORLD_W:         5000,
-  WORLD_H:         1000,
-  CAM_LERP:        0.09,
-  GROUND_Y:         900,    // top surface of ground floor
-  BOUNCE_FORCE:    -20,     // bounce flower launch velocity (normal jump is -11.5)
-  FLYTRAP_DELAY:    60,     // frames before flytrap snaps (1 second @ 60fps)
+  GRAVITY:            0.42,
+  FALL_GRAVITY:       0.22,
+  JUMP_FORCE:        -11.5,
+  DOUBLE_JUMP_FORCE: -10,    // second air jump (weaker)
+  MOVE_SPEED:         4.8,
+  FRICTION:           0.76,
+  TERMINAL_VEL:       6.5,
+  WORLD_W:           5000,
+  WORLD_H:           1000,
+  CAM_LERP:          0.09,
+  GROUND_Y:           900,
+  BOUNCE_FORCE:      -20,
+  FLYTRAP_DELAY:      60,
+  HEARTS_MAX:          5,
+  INVINCIBLE_FRAMES:  90,    // 1.5 s @ 60 fps
+  SPIDER_FIRE_RATE:  150,    // frames between web shots
+  GHOST_FIRE_RATE:   180,
+  TREE_FIRE_RATE:    180,
+  ROBOT_FIRE_RATE:   150,
 };
 
 // ── roundRect: always call beginPath() first ──────────────────
@@ -179,6 +186,7 @@ const TouchControls = (() => {
   // One-shot flags for tap actions
   let _shootFired = false, _shootFlash = 0;
   let _swapFired  = false, _swapFlash  = 0;
+  let _jumpFired  = false;
 
   function syncHeld(touches) {
     _touch.left = false; _touch.right = false; _touch.jump = false;
@@ -197,6 +205,7 @@ const TouchControls = (() => {
       const { x, y } = toCanvas(e.changedTouches[i].clientX, e.changedTouches[i].clientY);
       if (hit(x, y, 'shoot')) { _shootFired = true; _shootFlash = 10; }
       if (hit(x, y, 'swap'))  { _swapFired  = true; _swapFlash  = 12; }
+      if (hit(x, y, 'jump'))  { _jumpFired  = true; }
     }
   }, { passive: false });
 
@@ -216,6 +225,9 @@ const TouchControls = (() => {
     const v = _swapFired; _swapFired = false;
     if (_swapFlash > 0) _swapFlash--;
     return v;
+  }
+  function consumeJump() {
+    const v = _jumpFired; _jumpFired = false; return v;
   }
 
   // ── Button rendering ──────────────────────────────────────
@@ -295,7 +307,7 @@ const TouchControls = (() => {
     drawBtn('jump',  _touch.jump);
   }
 
-  return { consumeShoot, consumeSwap, draw };
+  return { consumeShoot, consumeSwap, consumeJump, draw };
 })();
 
 // ═══════════════════════════════════════════════════════════════
@@ -1199,38 +1211,91 @@ class Player {
     this.character = character;
     this.onGround = false;
     this.facingRight = true;
-    this.jumpHeld = false;
-    this.state = 'idle';      // 'idle' | 'run' | 'jump' | 'fall'
+    this.state = 'idle';
     this.animFrame = 0;
     this.animTick  = 0;
-    this.wingPhase = 0;       // for Parker's fairy wings
+    this.wingPhase = 0;
     this.dustTimer = 0;
-    this.shootTimer = 0;      // counts down after shooting; > 0 = aiming pose
+    this.shootTimer = 0;
+    // Double jump
+    this.airJumps = 0;        // 0 = air jump available, 1 = used
+    // Hearts & damage
+    this.hearts      = CFG.HEARTS_MAX;
+    this.invincible  = 0;     // countdown frames of invincibility
+    this.hurtKbX     = 0;    // knockback velocity
+    // Web trap
+    this.trappedTimer   = 0;
+    this.trapJumpPresses = 0;
+    // Goop slow (set by goop patches each frame)
+    this.inGoop = false;
   }
 
   update(platforms) {
+    // ── Invincibility & knockback ─────────────────────────────
+    if (this.invincible > 0) this.invincible--;
+    if (this.hurtKbX !== 0) {
+      this.vx = this.hurtKbX;
+      this.hurtKbX = 0;
+    }
+
+    // ── Web trap ─────────────────────────────────────────────
+    if (this.trappedTimer > 0) {
+      this.trappedTimer--;
+      this.vx = 0;
+      // Check for jump presses to free early
+      const jumpPr = TouchControls.consumeJump() || Input.wasPressed('ArrowUp') || Input.wasPressed('KeyW');
+      if (jumpPr) {
+        this.trapJumpPresses++;
+        if (this.trapJumpPresses >= 4) { this.trappedTimer = 0; this.trapJumpPresses = 0; }
+      }
+      // Still apply gravity and collide
+      const grav2 = this.vy < 0 ? CFG.GRAVITY : CFG.FALL_GRAVITY;
+      this.vy = Math.min(this.vy + grav2, CFG.TERMINAL_VEL);
+      this.y += this.vy;
+      this._resolveY(platforms);
+      this.wingPhase += 0.12;
+      return;
+    }
+
+    // ── Goop slow ────────────────────────────────────────────
+    const spd  = this.inGoop ? CFG.MOVE_SPEED * 0.5 : CFG.MOVE_SPEED;
+    this.inGoop = false; // reset each frame; goop patches set it back
+
     // ── Horizontal input ──────────────────────────────────────
     if (Input.left()) {
-      this.vx = -CFG.MOVE_SPEED;
+      this.vx = -spd;
       this.facingRight = false;
     } else if (Input.right()) {
-      this.vx =  CFG.MOVE_SPEED;
+      this.vx = spd;
       this.facingRight = true;
     } else {
       this.vx *= CFG.FRICTION;
     }
 
-    // ── Jump ─────────────────────────────────────────────────
-    const jumpKey = Input.jump();
-    if (jumpKey && this.onGround && !this.jumpHeld) {
-      this.vy = CFG.JUMP_FORCE;
-      this.onGround = false;
-      this.jumpHeld = true;
-      Particles.spawn(this.x + this.w / 2, this.y + this.h, {
-        count: 10, color: this._accentColor(), star: true, size: 5, rise: 4,
-      });
+    // ── Jump (press-edge, supports double jump) ────────────────
+    const jumpPressed = TouchControls.consumeJump() || Input.wasPressed('ArrowUp') || Input.wasPressed('KeyW');
+    const jumpForce   = this.inGoop ? CFG.JUMP_FORCE * 0.7 : CFG.JUMP_FORCE;
+    if (jumpPressed) {
+      if (this.onGround) {
+        this.vy = jumpForce;
+        this.onGround = false;
+        this.airJumps = 0;
+        Particles.spawn(this.x + this.w / 2, this.y + this.h, {
+          count: 10, color: this._accentColor(), star: true, size: 5, rise: 4,
+        });
+      } else if (this.airJumps < 1) {
+        this.vy = CFG.DOUBLE_JUMP_FORCE;
+        this.airJumps = 1;
+        // Ring of star sparkles for double jump
+        for (let i = 0; i < 8; i++) {
+          const ang = (Math.PI * 2 * i / 8);
+          Particles.spawn(this.x + this.w/2 + Math.cos(ang)*14, this.y + this.h/2 + Math.sin(ang)*14, {
+            count: 1, color: ['#fde68a','#c4b5fd','#86efac','#f9a8d4'][i%4],
+            star: true, size: 5, rise: 2, spread: 1, decay: 0.04,
+          });
+        }
+      }
     }
-    if (!jumpKey) this.jumpHeld = false;
 
     // ── Gravity ───────────────────────────────────────────────
     const grav = this.vy < 0 ? CFG.GRAVITY : CFG.FALL_GRAVITY;
@@ -1247,8 +1312,9 @@ class Player {
     this.y += this.vy;
     this._resolveY(platforms);
 
-    // Landing burst
+    // Landing: reset air jumps
     if (!wasOnGround && this.onGround) {
+      this.airJumps = 0;
       Particles.spawn(this.x + this.w / 2, this.y + this.h, {
         count: 8, color: this._accentColor(), spread: 5, rise: 1.5, gravity: 0.12,
       });
@@ -1260,9 +1326,9 @@ class Player {
     }
 
     // ── State & animation ────────────────────────────────────
-    if (!this.onGround)              this.state = this.vy < 0 ? 'jump' : 'fall';
+    if (!this.onGround)               this.state = this.vy < 0 ? 'jump' : 'fall';
     else if (Math.abs(this.vx) > 0.4) this.state = 'run';
-    else                              this.state = 'idle';
+    else                               this.state = 'idle';
 
     this.animTick++;
     if (this.state === 'run' && this.animTick % 7 === 0)
@@ -1282,6 +1348,17 @@ class Player {
         });
       }
     }
+  }
+
+  // Call to hurt the player (enemies, projectiles, traps)
+  hurt(sourceX) {
+    if (this.invincible > 0) return false;
+    this.hearts = Math.max(0, this.hearts - 1);
+    this.invincible = CFG.INVINCIBLE_FRAMES;
+    // Knockback away from source
+    this.hurtKbX = (this.x + this.w / 2 > sourceX) ? 5 : -5;
+    this.vy = -5;
+    return true;
   }
 
   _resolveX(platforms) {
@@ -1316,6 +1393,8 @@ class Player {
   }
 
   draw() {
+    // Flicker during invincibility (hide on even 4-frame intervals)
+    if (this.invincible > 0 && Math.floor(this.invincible / 4) % 2 === 0) return;
     const s = Camera.toScreen(this.x, this.y);
     ctx.save();
     if (!this.facingRight) {
@@ -1326,6 +1405,27 @@ class Player {
       this._drawChar(s.x, s.y);
     }
     ctx.restore();
+
+    // Web trap overlay
+    if (this.trappedTimer > 0) {
+      const ws = Camera.toScreen(this.x - 8, this.y - 8);
+      ctx.save();
+      ctx.globalAlpha = 0.7;
+      ctx.strokeStyle = '#e2e8f0';
+      ctx.lineWidth = 1.5;
+      // Simple web lines radiating from center
+      const cx = ws.x + this.w / 2 + 8, cy = ws.y + this.h / 2 + 8;
+      for (let i = 0; i < 6; i++) {
+        const ang = (Math.PI * 2 * i / 6);
+        ctx.beginPath(); ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + Math.cos(ang) * 22, cy + Math.sin(ang) * 22);
+        ctx.stroke();
+      }
+      for (let r = 8; r <= 20; r += 6) {
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.restore();
+    }
   }
 
   _drawChar(ox, oy) {
@@ -1638,12 +1738,14 @@ class FlytrapFlower {
         // Player escaped — reopen
         this.state = 'open'; this.closeAmt = 0; this.flashOn = false;
       } else if (this.timer <= 0) {
-        // Snap!
+        // Snap! — hurt player and launch them upward out of the mouth
         this.state = 'closed'; this.timer = 90; this.closeAmt = 1;
         this.passable = true;
-        // Kill player: poof
-        Particles.spawn(player.x + player.w / 2, player.y + player.h / 2, 20, '#f87171', 4);
-        player.x = 160; player.y = 490; player.vx = 0; player.vy = 0; player.onGround = false;
+        player.hurt(this.wx);
+        player.vy = -12;  // launch upward
+        Particles.spawn(player.x + player.w / 2, player.y + player.h / 2, {
+          count: 12, color: '#f87171', star: true, size: 4, rise: 4,
+        });
       }
 
     } else if (this.state === 'closed') {
@@ -1726,6 +1828,777 @@ function buildGroundFlowers() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  ENEMIES
+// ═══════════════════════════════════════════════════════════════
+
+const enemyProjectiles = [];
+const goopPatches = [];      // sticky ground patches left by ghosts
+const poisonDusts  = [];     // poison dust particles from butterflies
+
+class Enemy {
+  constructor(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.hp = 3; this.alive = true;
+    this.frozenTimer  = 0;   // ice: enemy can't move/attack
+    this.poisonTimer  = 0;   // vine: extra damage after 1s
+    this.poisonTick   = 0;
+    this.facing  = 1;        // 1=right, -1=left
+    this.fireTimer = 0;
+    this.deathAnim = 0;      // counts down on death (shrink/fade)
+  }
+
+  takeDamage(amount, type, player) {
+    if (!this.alive) return;
+    this.hp -= amount;
+    // Extra poison damage after 60 frames
+    if (type === 'vine' && this.poisonTimer === 0) {
+      this.poisonTimer = 60;
+    }
+    if (type === 'ice') {
+      this.frozenTimer = 120; // 2 seconds
+    }
+    if (this.hp <= 0) {
+      this.alive = false;
+      this.deathAnim = 40;
+      Particles.spawn(this.x + this.w/2, this.y + this.h/2, {
+        count: 16, color: '#fde68a', star: true, size: 7, rise: 5, spread: 6, decay: 0.03,
+      });
+    }
+  }
+
+  _updateTimers() {
+    if (this.frozenTimer  > 0) this.frozenTimer--;
+    if (this.poisonTimer  > 0) {
+      this.poisonTimer--;
+      if (this.poisonTimer === 0) this.hp = Math.max(0, this.hp - 1);
+      if (this.hp <= 0 && this.alive) {
+        this.alive = false; this.deathAnim = 40;
+        Particles.spawn(this.x + this.w/2, this.y + this.h/2, {
+          count: 12, color: '#4ade80', star: true, size: 5, rise: 4, decay: 0.035,
+        });
+      }
+    }
+  }
+
+  _drawHealthBar(sx, sy) {
+    if (this.hp >= 3) return; // only show when damaged
+    const bw = this.w, bh = 5;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(sx, sy - 10, bw, bh);
+    ctx.fillStyle = this.hp === 2 ? '#facc15' : '#f87171';
+    ctx.fillRect(sx, sy - 10, bw * (this.hp / 3), bh);
+  }
+
+  _drawFrozen(sx, sy) {
+    if (this.frozenTimer <= 0) return;
+    ctx.globalAlpha = 0.45;
+    ctx.fillStyle = '#bae6fd';
+    ctx.fillRect(sx - 2, sy - 2, this.w + 4, this.h + 4);
+    ctx.globalAlpha = 1;
+    // Ice crystals
+    ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1.5;
+    for (let i = 0; i < 3; i++) {
+      const cx2 = sx + this.w * (0.2 + i * 0.3), cy2 = sy + this.h * 0.3;
+      ctx.beginPath(); ctx.moveTo(cx2, cy2 - 7); ctx.lineTo(cx2, cy2 + 7); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx2 - 5, cy2 - 3); ctx.lineTo(cx2 + 5, cy2 + 3); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx2 + 5, cy2 - 3); ctx.lineTo(cx2 - 5, cy2 + 3); ctx.stroke();
+    }
+  }
+}
+
+// ── WEB SPIDER ────────────────────────────────────────────────
+class WebSpider extends Enemy {
+  constructor(x, y, platform) {
+    super(x, y, 42, 32);
+    this.platform = platform; // {x, y, w} for edge turning
+    this.fireTimer = CFG.SPIDER_FIRE_RATE;
+    this.legPhase  = 0;
+  }
+
+  update(player) {
+    if (!this.alive) return;
+    this._updateTimers();
+    if (this.frozenTimer > 0) return;
+
+    // Walk back and forth on platform
+    this.x += this.facing * 1.4;
+    if (this.x < this.platform.x) { this.x = this.platform.x; this.facing = 1; }
+    if (this.x + this.w > this.platform.x + this.platform.w) {
+      this.x = this.platform.x + this.platform.w - this.w; this.facing = -1;
+    }
+    this.legPhase += 0.18;
+
+    // Aim at player
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const dx = (player.x + player.w/2) - (this.x + this.w/2);
+    const dy = Math.abs((player.y + player.h/2) - (this.y + this.h/2));
+    if (Math.abs(dx) < 350 && dy < 120) {
+      this.facing = dx > 0 ? 1 : -1;
+      this.fireTimer--;
+      if (this.fireTimer <= 0) {
+        this.fireTimer = CFG.SPIDER_FIRE_RATE;
+        const spd = dx > 0 ? 4.5 : -4.5;
+        enemyProjectiles.push({ type:'web', x: this.x+this.w/2, y: this.y+8, vx:spd, vy:-1, w:14, h:14, active:true, age:0 });
+      }
+    }
+  }
+
+  draw() {
+    if (!this.alive && this.deathAnim <= 0) return;
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const { x: sx, y: sy } = Camera.toScreen(this.x, this.y);
+    ctx.save();
+    if (this.deathAnim > 0) {
+      this.deathAnim--;
+      const sc = this.deathAnim / 40;
+      ctx.globalAlpha = sc;
+      ctx.translate(sx + this.w/2, sy + this.h/2);
+      ctx.scale(sc, sc);
+      ctx.translate(-this.w/2, -this.h/2);
+    }
+    if (this.facing === -1) { ctx.translate(sx + this.w, sy); ctx.scale(-1,1); this._draw(0, 0); }
+    else this._draw(sx, sy);
+    ctx.restore();
+  }
+
+  _draw(sx, sy) {
+    const lp = this.legPhase;
+    // 8 legs
+    ctx.strokeStyle = '#4c1d95'; ctx.lineWidth = 2;
+    for (let i = 0; i < 4; i++) {
+      const side = i < 2 ? -1 : 1;
+      const ang = (Math.sin(lp + i * 1.1) * 0.4);
+      const lx = sx + this.w/2 + side * 10;
+      const ly = sy + this.h * 0.6;
+      ctx.beginPath(); ctx.moveTo(lx, ly);
+      ctx.lineTo(lx + side*(14+i*2), ly - 8 + Math.sin(ang)*6);
+      ctx.lineTo(lx + side*(20+i*2), ly + 6);
+      ctx.stroke();
+    }
+    // Body
+    const bg = ctx.createRadialGradient(sx+this.w/2, sy+this.h*0.55, 2, sx+this.w/2, sy+this.h*0.55, 16);
+    bg.addColorStop(0,'#7c3aed'); bg.addColorStop(1,'#1e1b4b');
+    ctx.fillStyle = bg;
+    ctx.beginPath(); ctx.ellipse(sx+this.w/2, sy+this.h*0.6, 15, 12, 0, 0, Math.PI*2); ctx.fill();
+    // Head
+    ctx.fillStyle = '#4c1d95';
+    ctx.beginPath(); ctx.ellipse(sx+this.w/2, sy+this.h*0.28, 11, 9, 0, 0, Math.PI*2); ctx.fill();
+    // Eyes
+    [[-5,0],[5,0]].forEach(([ex,ey]) => {
+      ctx.fillStyle = '#fde68a';
+      ctx.beginPath(); ctx.arc(sx+this.w/2+ex, sy+this.h*0.28+ey-1, 4, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#1e1b4b';
+      ctx.beginPath(); ctx.arc(sx+this.w/2+ex+0.5, sy+this.h*0.28+ey-1, 2, 0, Math.PI*2); ctx.fill();
+    });
+    this._drawFrozen(sx, sy);
+    this._drawHealthBar(sx, sy);
+  }
+}
+
+// ── GHOST ─────────────────────────────────────────────────────
+class Ghost extends Enemy {
+  constructor(x, y) {
+    super(x, y, 40, 50);
+    this.baseY = y;
+    this.bobPhase = Math.random() * Math.PI * 2;
+    this.driftX   = (Math.random() > 0.5 ? 1 : -1) * 0.8;
+    this.fireTimer = CFG.GHOST_FIRE_RATE;
+    this.hp = 3;
+  }
+
+  update(player) {
+    if (!this.alive) return;
+    this._updateTimers();
+    if (this.frozenTimer > 0) return;
+    this.bobPhase += 0.04;
+    this.y = this.baseY + Math.sin(this.bobPhase) * 22;
+    this.x += this.driftX;
+    if (this.x < 100 || this.x > CFG.WORLD_W - 100) this.driftX *= -1;
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const dx = (player.x+player.w/2)-(this.x+this.w/2);
+    if (Math.abs(dx) < 420) {
+      this.fireTimer--;
+      if (this.fireTimer <= 0) {
+        this.fireTimer = CFG.GHOST_FIRE_RATE;
+        const spd = dx > 0 ? 3 : -3;
+        enemyProjectiles.push({ type:'goop', x:this.x+this.w/2, y:this.y+this.h, vx:spd, vy:-4, w:16, h:16, active:true, age:0 });
+      }
+    }
+  }
+
+  draw() {
+    if (!this.alive && this.deathAnim <= 0) return;
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const { x: sx, y: sy } = Camera.toScreen(this.x, this.y);
+    ctx.save();
+    if (this.deathAnim > 0) {
+      this.deathAnim--;
+      const sc = this.deathAnim / 40;
+      ctx.globalAlpha = sc;
+      ctx.translate(sx+this.w/2, sy+this.h/2); ctx.scale(sc,sc); ctx.translate(-this.w/2,-this.h/2);
+    } else {
+      ctx.globalAlpha = 0.82;
+    }
+    // Body
+    ctx.fillStyle = '#e0f2fe';
+    ctx.beginPath();
+    ctx.arc(sx+this.w/2, sy+this.h*0.38, 18, Math.PI, 0);
+    ctx.lineTo(sx+this.w, sy+this.h);
+    // Wavy bottom
+    for (let i = 4; i >= 0; i--) {
+      const wbx = sx + this.w * (i / 4);
+      ctx.lineTo(wbx, sy+this.h - (i%2===0?6:0));
+    }
+    ctx.closePath(); ctx.fill();
+    // Face
+    ctx.fillStyle = '#1e3a5f';
+    ctx.beginPath(); ctx.arc(sx+this.w/2-7, sy+this.h*0.32, 4, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+this.w/2+7, sy+this.h*0.32, 4, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#1e3a5f'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sx+this.w/2, sy+this.h*0.52, 7, 0.1, Math.PI-0.1); ctx.stroke();
+    this._drawFrozen(sx, sy);
+    this._drawHealthBar(sx, sy);
+    ctx.restore();
+  }
+}
+
+// ── HAUNTED TREE ──────────────────────────────────────────────
+class HauntedTree extends Enemy {
+  constructor(x, y) {
+    super(x, y, 56, 80);
+    this.fireTimer = CFG.TREE_FIRE_RATE;
+  }
+
+  update(player) {
+    if (!this.alive) return;
+    this._updateTimers();
+    if (this.frozenTimer > 0) return;
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const dx = (player.x+player.w/2)-(this.x+this.w/2);
+    this.facing = dx > 0 ? 1 : -1;
+    if (Math.abs(dx) < 400) {
+      this.fireTimer--;
+      if (this.fireTimer <= 0) {
+        this.fireTimer = CFG.TREE_FIRE_RATE;
+        const vx = this.facing * 3.5;
+        enemyProjectiles.push({ type:'apple', x:this.x+this.w/2, y:this.y+10, vx, vy:-5.5, w:14, h:14, active:true, age:0 });
+      }
+    }
+  }
+
+  draw() {
+    if (!this.alive && this.deathAnim <= 0) return;
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const { x: sx, y: sy } = Camera.toScreen(this.x, this.y);
+    ctx.save();
+    if (this.deathAnim > 0) {
+      this.deathAnim--;
+      const sc = this.deathAnim/40;
+      ctx.globalAlpha = sc;
+      ctx.translate(sx+this.w/2,sy+this.h/2); ctx.scale(sc,sc); ctx.translate(-this.w/2,-this.h/2);
+    }
+    // Trunk
+    const tg = ctx.createLinearGradient(sx+this.w*0.3,sy,sx+this.w*0.7,sy+this.h);
+    tg.addColorStop(0,'#44403c'); tg.addColorStop(1,'#1c1917');
+    ctx.fillStyle = tg;
+    ctx.fillRect(sx+this.w*0.3, sy+this.h*0.35, this.w*0.4, this.h*0.65);
+    // Branches (arms)
+    ctx.strokeStyle = '#292524'; ctx.lineWidth = 7; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(sx+this.w*0.35, sy+this.h*0.42);
+    ctx.lineTo(sx-10, sy+this.h*0.28); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx+this.w*0.65, sy+this.h*0.42);
+    ctx.lineTo(sx+this.w+10, sy+this.h*0.28); ctx.stroke();
+    ctx.lineWidth=4;
+    ctx.beginPath(); ctx.moveTo(sx-10, sy+this.h*0.28); ctx.lineTo(sx-18,sy+this.h*0.18); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx-10, sy+this.h*0.28); ctx.lineTo(sx-2,sy+this.h*0.14); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx+this.w+10,sy+this.h*0.28); ctx.lineTo(sx+this.w+18,sy+this.h*0.18); ctx.stroke();
+    // Canopy
+    ctx.fillStyle = '#14532d';
+    ctx.beginPath(); ctx.arc(sx+this.w/2, sy+this.h*0.22, 24, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#166534';
+    ctx.beginPath(); ctx.arc(sx+this.w/2-14, sy+this.h*0.26, 16, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+this.w/2+14, sy+this.h*0.26, 16, 0, Math.PI*2); ctx.fill();
+    // Angry face
+    ctx.fillStyle = '#fde68a';
+    ctx.beginPath(); ctx.ellipse(sx+this.w/2, sy+this.h*0.56, 11, 10, 0, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#78350f'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(sx+this.w/2-7,sy+this.h*0.52); ctx.lineTo(sx+this.w/2-3,sy+this.h*0.56); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx+this.w/2+7,sy+this.h*0.52); ctx.lineTo(sx+this.w/2+3,sy+this.h*0.56); ctx.stroke();
+    ctx.fillStyle='#78350f';
+    ctx.beginPath(); ctx.arc(sx+this.w/2-5,sy+this.h*0.54,2.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+this.w/2+5,sy+this.h*0.54,2.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+this.w/2,sy+this.h*0.63,5,0,Math.PI); ctx.fill();
+    this._drawFrozen(sx, sy);
+    this._drawHealthBar(sx, sy);
+    ctx.restore();
+  }
+}
+
+// ── POISON BUTTERFLY ──────────────────────────────────────────
+class PoisonButterfly extends Enemy {
+  constructor(x, y, patrolW) {
+    super(x, y, 40, 36);
+    this.startX   = x;
+    this.patrolW  = patrolW ?? 300;
+    this.wingPhase = 0;
+    this.wavePhase = 0;
+    this.dustTimer = 0;
+  }
+
+  update(player) {
+    if (!this.alive) return;
+    this._updateTimers();
+    if (this.frozenTimer > 0) return;
+    this.x += this.facing * 1.6;
+    if (this.x < this.startX)                    { this.x = this.startX;             this.facing =  1; }
+    if (this.x + this.w > this.startX+this.patrolW) { this.x = this.startX+this.patrolW-this.w; this.facing = -1; }
+    this.wingPhase += 0.22;
+    this.wavePhase += 0.06;
+    this.y += Math.sin(this.wavePhase) * 0.5;
+
+    // Drop poison dust
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    this.dustTimer++;
+    if (this.dustTimer % 8 === 0) {
+      poisonDusts.push({ x:this.x+this.w/2, y:this.y+this.h, vx:(Math.random()-0.5)*0.6, vy:0.4, life:1, decay:0.011, r:5 });
+    }
+  }
+
+  draw() {
+    if (!this.alive && this.deathAnim <= 0) return;
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const { x: sx, y: sy } = Camera.toScreen(this.x, this.y);
+    ctx.save();
+    if (this.deathAnim > 0) {
+      this.deathAnim--;
+      const sc = this.deathAnim/40;
+      ctx.globalAlpha = sc;
+      ctx.translate(sx+this.w/2,sy+this.h/2); ctx.scale(sc,sc); ctx.translate(-this.w/2,-this.h/2);
+    }
+    const wf = Math.sin(this.wingPhase);
+    // Wings (top)
+    ctx.fillStyle = '#86efac';
+    ctx.beginPath(); ctx.ellipse(sx+this.w/2-14*Math.abs(wf), sy+this.h*0.3, 16, 10, -0.4+wf*0.3, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(sx+this.w/2+14*Math.abs(wf), sy+this.h*0.3, 16, 10, 0.4-wf*0.3, 0, Math.PI*2); ctx.fill();
+    // Wings (bottom)
+    ctx.fillStyle = '#a855f7';
+    ctx.beginPath(); ctx.ellipse(sx+this.w/2-10*Math.abs(wf), sy+this.h*0.56, 11, 8, -0.6+wf*0.3, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(sx+this.w/2+10*Math.abs(wf), sy+this.h*0.56, 11, 8, 0.6-wf*0.3, 0, Math.PI*2); ctx.fill();
+    // Purple spots on wings
+    ctx.fillStyle = '#7e22ce';
+    ctx.beginPath(); ctx.arc(sx+this.w/2-14*Math.abs(wf),sy+this.h*0.28,4,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+this.w/2+14*Math.abs(wf),sy+this.h*0.28,4,0,Math.PI*2); ctx.fill();
+    // Body
+    ctx.fillStyle = '#166534';
+    ctx.beginPath(); ctx.ellipse(sx+this.w/2,sy+this.h*0.45,5,13,0,0,Math.PI*2); ctx.fill();
+    // Face
+    ctx.fillStyle = '#fde68a';
+    ctx.beginPath(); ctx.arc(sx+this.w/2,sy+this.h*0.18,6,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#1e3a1e';
+    ctx.beginPath(); ctx.arc(sx+this.w/2-2.5,sy+this.h*0.17,1.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+this.w/2+2.5,sy+this.h*0.17,1.5,0,Math.PI*2); ctx.fill();
+    this._drawFrozen(sx, sy);
+    this._drawHealthBar(sx, sy);
+    ctx.restore();
+  }
+}
+
+// ── ROBOT ─────────────────────────────────────────────────────
+class Robot extends Enemy {
+  constructor(x, y, platform) {
+    super(x, y, 38, 46);
+    this.platform = platform;
+    this.fireTimer = CFG.ROBOT_FIRE_RATE;
+    this.rollPhase = 0;
+  }
+
+  update(player) {
+    if (!this.alive) return;
+    this._updateTimers();
+    if (this.frozenTimer > 0) return;
+    this.x += this.facing * 1.8;
+    if (this.x < this.platform.x) { this.x = this.platform.x; this.facing = 1; }
+    if (this.x + this.w > this.platform.x + this.platform.w) {
+      this.x = this.platform.x + this.platform.w - this.w; this.facing = -1;
+    }
+    this.rollPhase += 0.14;
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const dx = (player.x+player.w/2)-(this.x+this.w/2);
+    this.facing = dx > 0 ? 1 : -1;
+    if (Math.abs(dx) < 400) {
+      this.fireTimer--;
+      if (this.fireTimer <= 0) {
+        this.fireTimer = CFG.ROBOT_FIRE_RATE;
+        const vx = this.facing * 5;
+        enemyProjectiles.push({ type:'wrench', x:this.x+this.w/2, y:this.y+this.h*0.3, vx, vy:-4.5, w:14, h:12, active:true, age:0, spin:0 });
+      }
+    }
+  }
+
+  draw() {
+    if (!this.alive && this.deathAnim <= 0) return;
+    if (!Camera.inView(this.x, this.y, this.w, this.h)) return;
+    const { x: sx, y: sy } = Camera.toScreen(this.x, this.y);
+    ctx.save();
+    if (this.deathAnim > 0) {
+      this.deathAnim--;
+      const sc = this.deathAnim/40;
+      ctx.globalAlpha = sc;
+      ctx.translate(sx+this.w/2,sy+this.h/2); ctx.scale(sc,sc); ctx.translate(-this.w/2,-this.h/2);
+    }
+    if (this.facing === -1) { ctx.translate(sx+this.w,sy); ctx.scale(-1,1); this._draw(0,0); }
+    else this._draw(sx,sy);
+    ctx.restore();
+  }
+
+  _draw(sx, sy) {
+    // Legs/wheels
+    ctx.fillStyle = '#374151';
+    ctx.beginPath(); ctx.arc(sx+this.w*0.28, sy+this.h, 7, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+this.w*0.72, sy+this.h, 7, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#6b7280'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(sx+this.w*0.28,sy+this.h+7); ctx.lineTo(sx+this.w*0.72,sy+this.h+7); ctx.stroke();
+    // Body
+    const bg = ctx.createLinearGradient(sx,sy+this.h*0.42,sx+this.w,sy+this.h*0.9);
+    bg.addColorStop(0,'#9ca3af'); bg.addColorStop(1,'#4b5563');
+    ctx.fillStyle = bg;
+    ctx.roundRect(sx+2, sy+this.h*0.42, this.w-4, this.h*0.52, 4); ctx.fill();
+    // Blue chest panel
+    ctx.fillStyle = '#1d4ed8';
+    ctx.roundRect(sx+8, sy+this.h*0.52, this.w-16, this.h*0.28, 3); ctx.fill();
+    ctx.fillStyle='#60a5fa';
+    for (let i=0;i<3;i++) { ctx.beginPath(); ctx.arc(sx+13+i*8,sy+this.h*0.63,2.5,0,Math.PI*2); ctx.fill(); }
+    // Head
+    ctx.fillStyle='#6b7280';
+    ctx.roundRect(sx+5, sy+this.h*0.1, this.w-10, this.h*0.34, 5); ctx.fill();
+    // Antenna
+    ctx.strokeStyle='#9ca3af'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(sx+this.w/2,sy+this.h*0.1); ctx.lineTo(sx+this.w/2,sy+this.h*0.02); ctx.stroke();
+    ctx.fillStyle='#ef4444'; ctx.beginPath(); ctx.arc(sx+this.w/2,sy+this.h*0.02,3.5,0,Math.PI*2); ctx.fill();
+    // Eye (single red)
+    ctx.fillStyle='#111827'; ctx.roundRect(sx+8,sy+this.h*0.18,this.w-16,this.h*0.16,3); ctx.fill();
+    ctx.fillStyle='#ef4444'; ctx.beginPath(); ctx.arc(sx+this.w/2,sy+this.h*0.26,5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='rgba(255,100,100,0.5)'; ctx.beginPath(); ctx.arc(sx+this.w/2,sy+this.h*0.26,8,0,Math.PI*2); ctx.fill();
+    this._drawFrozen(sx, sy);
+    this._drawHealthBar(sx, sy);
+  }
+}
+
+// ── ENEMY PROJECTILE UPDATE & DRAW ────────────────────────────
+function updateEnemyProjectiles(player) {
+  for (let i = enemyProjectiles.length - 1; i >= 0; i--) {
+    const p = enemyProjectiles[i];
+    p.x += p.vx; p.vy += 0.3; p.y += p.vy; p.age++;
+    if (p.type === 'wrench') p.spin = (p.spin ?? 0) + 0.3;
+    if (!p.active || p.x < 0 || p.x > CFG.WORLD_W || p.y > CFG.WORLD_H + 100) {
+      enemyProjectiles.splice(i, 1); continue;
+    }
+    // Check ground / platform landing for goop
+    if (p.type === 'goop' && p.vy > 0 && p.y + p.h >= CFG.GROUND_Y) {
+      goopPatches.push({ x: p.x - 45, y: CFG.GROUND_Y - 4, w: 90, timer: 360 });
+      enemyProjectiles.splice(i, 1); continue;
+    }
+    // Hit player
+    const hit = player.x < p.x+p.w && player.x+player.w > p.x &&
+                player.y < p.y+p.h && player.y+player.h > p.y;
+    if (hit) {
+      player.hurt(p.x);
+      if (p.type === 'web') {
+        player.trappedTimer = 90; player.trapJumpPresses = 0;
+      } else if (p.type === 'goop') {
+        goopPatches.push({ x: player.x - 20, y: player.y + player.h - 4, w: 60, timer: 360 });
+      }
+      enemyProjectiles.splice(i, 1); continue;
+    }
+  }
+
+  // Update goop patches
+  for (let i = goopPatches.length - 1; i >= 0; i--) {
+    goopPatches[i].timer--;
+    if (goopPatches[i].timer <= 0) { goopPatches.splice(i, 1); continue; }
+    // Check if player is in this patch
+    const g = goopPatches[i];
+    if (player.x + player.w > g.x && player.x < g.x + g.w &&
+        Math.abs((player.y + player.h) - g.y) < 14) {
+      player.inGoop = true;
+    }
+  }
+
+  // Update poison dust
+  for (let i = poisonDusts.length - 1; i >= 0; i--) {
+    const d = poisonDusts[i];
+    d.x += d.vx; d.y += d.vy; d.vy += 0.04; d.life -= d.decay;
+    if (d.life <= 0) { poisonDusts.splice(i, 1); continue; }
+    // Check player hit
+    const sc = Camera.toScreen(d.x, d.y);
+    if (player.x < d.x+d.r && player.x+player.w > d.x-d.r &&
+        player.y < d.y+d.r && player.y+player.h > d.y-d.r) {
+      player.hurt(d.x);
+    }
+  }
+}
+
+function drawEnemyProjectiles() {
+  for (const p of enemyProjectiles) {
+    if (!Camera.inView(p.x, p.y, p.w, p.h)) continue;
+    const { x: sx, y: sy } = Camera.toScreen(p.x, p.y);
+    if (p.type === 'web') {
+      ctx.fillStyle = 'rgba(230,230,255,0.9)';
+      ctx.beginPath(); ctx.arc(sx+p.w/2, sy+p.h/2, p.w/2, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#c7d2fe'; ctx.lineWidth = 1;
+      for (let ang = 0; ang < Math.PI*2; ang += Math.PI/4) {
+        ctx.beginPath(); ctx.moveTo(sx+p.w/2,sy+p.h/2);
+        ctx.lineTo(sx+p.w/2+Math.cos(ang)*(p.w/2-1), sy+p.h/2+Math.sin(ang)*(p.h/2-1)); ctx.stroke();
+      }
+    } else if (p.type === 'goop') {
+      ctx.fillStyle = '#4ade80';
+      ctx.beginPath(); ctx.ellipse(sx+p.w/2, sy+p.h/2, p.w/2, p.h/2+2, Math.sin(p.age*0.2)*0.4, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = 'rgba(21,128,61,0.6)';
+      ctx.beginPath(); ctx.arc(sx+p.w/2, sy+p.h/2, p.w/2-3, 0, Math.PI*2); ctx.fill();
+    } else if (p.type === 'apple') {
+      ctx.fillStyle = '#16a34a';
+      ctx.beginPath(); ctx.arc(sx+p.w/2, sy+p.h/2, p.w/2, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#7e22ce'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(sx+p.w/2, sy+p.h/2, p.w/2-2, 0.3, 0.3+Math.PI*1.5); ctx.stroke();
+      ctx.fillStyle = '#422006';
+      ctx.fillRect(sx+p.w/2-1, sy+1, 2, 5);
+    } else if (p.type === 'wrench') {
+      ctx.save(); ctx.translate(sx+p.w/2, sy+p.h/2); ctx.rotate(p.spin ?? 0);
+      ctx.fillStyle = '#d1d5db';
+      ctx.fillRect(-p.w/2, -3, p.w, 6);
+      ctx.beginPath(); ctx.arc(-p.w/2+2, 0, 5, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc( p.w/2-2, 0, 5, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#6b7280';
+      ctx.fillRect(-p.w/2, -1.5, p.w, 3);
+      ctx.restore();
+    }
+  }
+
+  // Draw goop patches
+  for (const g of goopPatches) {
+    const { x: gsx, y: gsy } = Camera.toScreen(g.x, g.y);
+    const alpha = Math.min(1, g.timer / 60);
+    ctx.globalAlpha = alpha * 0.65;
+    ctx.fillStyle = '#4ade80';
+    ctx.beginPath(); ctx.ellipse(gsx + g.w/2, gsy, g.w/2, 8, 0, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // Draw poison dust
+  for (const d of poisonDusts) {
+    const { x: dsx, y: dsy } = Camera.toScreen(d.x, d.y);
+    ctx.globalAlpha = d.life * 0.8;
+    ctx.fillStyle = '#86efac';
+    ctx.shadowColor = '#4ade80'; ctx.shadowBlur = 4;
+    ctx.beginPath(); ctx.arc(dsx, dsy, d.r * d.life, 0, Math.PI*2); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ── CHECK ENEMY BODY CONTACT WITH PLAYER ──────────────────────
+function checkEnemyContact(player, enemies) {
+  if (player.invincible > 0) return;
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    if (player.x + player.w > e.x + 4 && player.x < e.x + e.w - 4 &&
+        player.y + player.h > e.y + 4 && player.y < e.y + e.h - 4) {
+      player.hurt(e.x + e.w / 2);
+    }
+  }
+}
+
+// ── PLAYER PROJECTILES HIT ENEMIES ────────────────────────────
+function checkPlayerProjectilesVsEnemies(enemies) {
+  for (let pi = projectiles.length - 1; pi >= 0; pi--) {
+    const pr = projectiles[pi];
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      if (pr.x < e.x+e.w && pr.x+pr.w > e.x && pr.y < e.y+e.h && pr.y+pr.h > e.y) {
+        e.takeDamage(1, pr.type);
+        Particles.spawn(pr.x, pr.y, {
+          count: 6, color: pr.type === 'ice' ? '#bae6fd' : '#4ade80',
+          size: 4, spread: 3, rise: 2, decay: 0.07,
+        });
+        pr.active = false;
+        break;
+      }
+    }
+  }
+}
+
+// ── ENEMY PLACEMENT ───────────────────────────────────────────
+function buildEnemies() {
+  // Platform refs  (x, y, w) — used for patrol boundaries
+  const p0  = { x: 80,   y: 550, w: 320 };  // starting island
+  const p1  = { x: 920,  y: 460, w: 260 };  // first big island
+  const p2  = { x: 1540, y: 330, w: 220 };  // mid island
+  const p3  = { x: 2260, y: 360, w: 300 };  // wide flower island
+  const p4  = { x: 3360, y: 370, w: 360 };  // grand central island
+  const p5  = { x: 4240, y: 360, w: 420 };  // final island
+  const gnd = { x: 0,    y: 900, w: CFG.WORLD_W }; // ground
+
+  return [
+    // === FIRST THIRD (600–1800px) — robots and spiders ===
+    new Robot(970,  p1.y - 46, p1),
+    new WebSpider(1200, p1.y - 32, p1),
+
+    new Robot(1600, p2.y - 46, p2),
+    new WebSpider(1680, p2.y - 32, p2),
+
+    // Ground robots (first section)
+    new Robot(900,  gnd.y - 46, { x: 700, y: gnd.y, w: 500 }),
+    new Robot(1500, gnd.y - 46, { x: 1300, y: gnd.y, w: 400 }),
+
+    // === MIDDLE THIRD (1800–3400px) — add ghosts ===
+    new Ghost(2050, 300),
+    new Ghost(2600, 280),
+
+    new Robot(2320, p3.y - 46, p3),
+    new WebSpider(2450, p3.y - 32, p3),
+
+    new HauntedTree(2200, gnd.y - 80),
+    new Robot(2900, gnd.y - 46, { x: 2700, y: gnd.y, w: 500 }),
+
+    // === LAST HALF (3400–5000px) — add trees, butterflies ===
+    new Ghost(3100, 250),
+
+    new HauntedTree(3420, p4.y - 80),
+    new Robot(3600, p4.y - 46, p4),
+
+    new PoisonButterfly(2800, 500, 300),
+    new PoisonButterfly(3700, 420, 280),
+
+    new HauntedTree(3200, gnd.y - 80),
+    new HauntedTree(3900, gnd.y - 80),
+    new Robot(4000, gnd.y - 46, { x: 3800, y: gnd.y, w: 400 }),
+
+    new WebSpider(4300, p5.y - 32, p5),
+    new Robot(4450, p5.y - 46, p5),
+    new HauntedTree(4600, p5.y - 80),
+
+    new PoisonButterfly(4500, 350, 250),
+  ];
+}
+
+// ── HEARTS HUD + GAME-OVER OVERLAY ────────────────────────────
+let _gameOver = false;
+const _heartAnims = []; // {idx, scale, anim:'pop'|'break', t}
+
+function resetGame() {
+  _gameOver = false;
+  _heartAnims.length = 0;
+  player = new Player(160, 490, activeChar);
+  Camera.x = player.x + player.w/2 - Camera.W/2;
+  Camera.y = player.y + player.h/2 - Camera.H*0.52;
+  Camera.x = Math.max(0, Math.min(Camera.x, CFG.WORLD_W - Camera.W));
+  Camera.y = Math.max(0, Math.min(Camera.y, CFG.WORLD_H - Camera.H));
+  // Rebuild enemies
+  enemies.length = 0;
+  enemies.push(...buildEnemies());
+}
+
+function drawHearts(player) {
+  const HX = canvas.width - 10, HY = 14;
+  const HR = 13, GAP = 6;
+  const total = CFG.HEARTS_MAX;
+  const full  = player.hearts;
+  for (let i = total - 1; i >= 0; i--) {
+    const sx = HX - (total - i) * (HR * 2 + GAP);
+    const sy = HY;
+    const isFull = i < full;
+    // Check anim
+    const anim = _heartAnims.find(a => a.idx === i);
+    if (anim) {
+      if (anim.anim === 'pop') {
+        anim.t++;
+        const sc = 1 + Math.sin(anim.t * 0.3) * 0.4 * (1 - anim.t / 20);
+        ctx.save(); ctx.translate(sx + HR, sy + HR); ctx.scale(sc, sc);
+        _drawHeart(ctx, -HR, -HR, HR * 2, isFull ? '#ef4444' : '#374151');
+        ctx.restore();
+        if (anim.t >= 20) {
+          anim.anim = 'break'; anim.t = 0;
+        }
+      } else { // break — two halves fall
+        anim.t++;
+        const fall = anim.t * anim.t * 0.08;
+        const spread = anim.t * 1.5;
+        ctx.save(); ctx.globalAlpha = Math.max(0, 1 - anim.t / 30);
+        ctx.fillStyle = '#ef4444';
+        // Left half
+        ctx.save(); ctx.translate(sx + HR - spread, sy + HR + fall); ctx.rotate(-0.4);
+        ctx.beginPath(); ctx.arc(0, 0, HR * 0.8, Math.PI, 0); ctx.fill();
+        ctx.restore();
+        // Right half
+        ctx.save(); ctx.translate(sx + HR + spread, sy + HR + fall); ctx.rotate(0.4);
+        ctx.beginPath(); ctx.arc(0, 0, HR * 0.8, Math.PI, 0); ctx.fill();
+        ctx.restore();
+        ctx.restore();
+        if (anim.t >= 30) _heartAnims.splice(_heartAnims.indexOf(anim), 1);
+      }
+    } else {
+      _drawHeart(ctx, sx, sy, HR * 2, isFull ? '#ef4444' : '#374151');
+      if (!isFull) {
+        ctx.strokeStyle = '#6b7280'; ctx.lineWidth = 1.5;
+        _drawHeartStroke(ctx, sx, sy, HR * 2);
+      }
+    }
+  }
+}
+
+function _drawHeart(ctx, x, y, size, color) {
+  const cx = x + size/2, cy = y + size*0.42;
+  const r = size * 0.28;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(cx - r * 0.9, cy, r, Math.PI, 0);
+  ctx.arc(cx + r * 0.9, cy, r, Math.PI, 0);
+  ctx.lineTo(cx, cy + size * 0.52);
+  ctx.closePath(); ctx.fill();
+}
+function _drawHeartStroke(ctx, x, y, size) {
+  const cx = x + size/2, cy = y + size*0.42;
+  const r = size * 0.28;
+  ctx.beginPath();
+  ctx.arc(cx - r * 0.9, cy, r, Math.PI, 0);
+  ctx.arc(cx + r * 0.9, cy, r, Math.PI, 0);
+  ctx.lineTo(cx, cy + size * 0.52);
+  ctx.closePath(); ctx.stroke();
+}
+
+function triggerHeartLoss(idx) {
+  if (!_heartAnims.find(a => a.idx === idx)) {
+    _heartAnims.push({ idx, anim: 'pop', t: 0 });
+  }
+}
+
+let _prevHearts = CFG.HEARTS_MAX;
+function checkHeartChange(player) {
+  if (player.hearts < _prevHearts) {
+    for (let i = _prevHearts - 1; i >= player.hearts; i--) {
+      triggerHeartLoss(i);
+    }
+  }
+  _prevHearts = player.hearts;
+  if (player.hearts <= 0 && !_gameOver) _gameOver = true;
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.72)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fde68a';
+  ctx.font = 'bold 56px Georgia';
+  ctx.shadowColor = '#f87171'; ctx.shadowBlur = 20;
+  ctx.fillText('Oh no!', canvas.width/2, canvas.height*0.38);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#fff';
+  ctx.font = '24px Georgia';
+  ctx.fillText('Tap or press any key to try again', canvas.width/2, canvas.height*0.56);
+  ctx.textAlign = 'left';
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  HUD
 // ═══════════════════════════════════════════════════════════════
 function drawHUD(player) {
@@ -1740,12 +2613,14 @@ function drawHUD(player) {
   ctx.fillText(isPen ? '✨ Penelope  —  Magic Elf'
                      : '🧚 Parker  —  Magical Fairy', 18, 33);
 
-  // Tab / switch hint (top-right)
-  ctx.fillStyle = 'rgba(255,255,255,0.55)';
-  ctx.font = '11px Georgia';
+  // Hearts (top-right)
+  drawHearts(player);
+
+  // Switch hint — below hearts, small
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  ctx.font = '10px Georgia';
   ctx.textAlign = 'right';
-  ctx.fillText(IS_TOUCH ? 'Tab: switch character' : '[Tab] switch character',
-               canvas.width - 10, 26);
+  ctx.fillText(IS_TOUCH ? 'SWAP: switch' : '[Tab] switch', canvas.width - 10, 50);
   ctx.textAlign = 'left';
 
   // Keyboard controls bar — only shown on non-touch devices
@@ -1755,7 +2630,7 @@ function drawHUD(player) {
     ctx.fill();
     ctx.fillStyle = 'rgba(255,255,255,0.65)';
     ctx.font = '10px Georgia';
-    ctx.fillText('← → / A D  Move     ↑ / W  Jump     Space  Shoot', 16, canvas.height - 13);
+    ctx.fillText('← → Move     ↑ Jump (double-jump!)     Space Shoot', 16, canvas.height - 13);
   }
 }
 
@@ -1924,6 +2799,7 @@ const SelectScreen = (() => {
 // ═══════════════════════════════════════════════════════════════
 const platforms = buildSkyIslandWorld();
 const flowers   = buildGroundFlowers();
+const enemies   = buildEnemies();
 let gameState = 'select'; // 'select' | 'playing'
 let activeChar = 'penelope';
 let player = null;
@@ -1931,8 +2807,9 @@ let player = null;
 function selectCharacter(ch) {
   activeChar = ch;
   player = new Player(160, 490, ch);
+  _prevHearts = CFG.HEARTS_MAX;
+  _gameOver = false;
   gameState = 'playing';
-  // Snap camera to starting position
   Camera.x = player.x + player.w / 2 - Camera.W / 2;
   Camera.y = player.y + player.h / 2 - Camera.H * 0.52;
   Camera.x = Math.max(0, Math.min(Camera.x, CFG.WORLD_W - Camera.W));
@@ -1942,9 +2819,13 @@ function selectCharacter(ch) {
 function switchCharacter() {
   activeChar = activeChar === 'penelope' ? 'parker' : 'penelope';
   const np = new Player(player.x, player.y, activeChar);
-  np.vx = player.vx;
-  np.vy = -4;
+  np.vx = player.vx; np.vy = -4;
+  np.hearts     = player.hearts;
+  np.invincible = player.invincible;
+  np.airJumps   = player.airJumps;
+  np.trappedTimer = player.trappedTimer;
   player = np;
+  _prevHearts = player.hearts;
   Particles.spawn(player.x + player.w / 2, player.y + player.h / 2, {
     count: 14, color: activeChar === 'penelope' ? '#c084fc' : '#67e8f9',
     spread: 5, rise: 4, star: true, size: 6, decay: 0.02,
@@ -1953,7 +2834,10 @@ function switchCharacter() {
 
 window.addEventListener('keydown', e => {
   if (e.code === 'Tab') { e.preventDefault(); if (gameState === 'playing') switchCharacter(); }
+  if (_gameOver && gameState === 'playing') resetGame();
 });
+canvas.addEventListener('click', e => { if (_gameOver && gameState === 'playing') resetGame(); });
+canvas.addEventListener('touchend', e => { if (_gameOver && gameState === 'playing') { e.preventDefault(); resetGame(); } }, { passive: false });
 
 function gameLoop() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1966,29 +2850,39 @@ function gameLoop() {
   }
 
   // ── Playing: Update ─────────────────────────────────────────
-  player.update([...platforms, ...flowers]);
-  for (const f of flowers) f.update(player);
-  Camera.update(player);
-  BG.update();
-  Particles.update();
+  if (!_gameOver) {
+    player.update([...platforms, ...flowers]);
+    for (const f of flowers) f.update(player);
+    for (const e of enemies) e.update(player);
+    updateEnemyProjectiles(player);
+    checkEnemyContact(player, enemies);
+    checkPlayerProjectilesVsEnemies(enemies);
+    checkHeartChange(player);
+    Camera.update(player);
+    BG.update();
+    Particles.update();
 
-  for (let i = projectiles.length - 1; i >= 0; i--) {
-    projectiles[i].update();
-    if (!projectiles[i].active) projectiles.splice(i, 1);
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      projectiles[i].update();
+      if (!projectiles[i].active) projectiles.splice(i, 1);
+    }
+
+    if (TouchControls.consumeShoot() || Input.wasPressed('Space')) shootAction(player);
+    if (TouchControls.consumeSwap()) switchCharacter();
   }
-
-  if (TouchControls.consumeShoot() || Input.wasPressed('Space')) shootAction(player);
-  if (TouchControls.consumeSwap()) switchCharacter();
   Input.clearFrame();
 
   // ── Playing: Draw ───────────────────────────────────────────
   BG.draw();
   for (const p of platforms) p.draw();
   for (const f of flowers) f.draw();
+  for (const e of enemies) e.draw();
+  drawEnemyProjectiles();
   Particles.draw();
   for (const pr of projectiles) pr.draw();
   player.draw();
   drawHUD(player);
+  if (_gameOver) drawGameOver();
   TouchControls.draw();
 
   requestAnimationFrame(gameLoop);
