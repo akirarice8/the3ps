@@ -66,33 +66,47 @@ const IS_TOUCH = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
 // ── Tunable constants ─────────────────────────────────────────
 const CFG = {
-  GRAVITY:         0.42,
+  GRAVITY:         0.42,   // upward acceleration (while vy < 0)
+  FALL_GRAVITY:    0.22,   // gentler gravity while falling (vy >= 0)
   JUMP_FORCE:     -11.5,
   MOVE_SPEED:      4.8,
   FRICTION:        0.76,   // horizontal deceleration when no key held
-  TERMINAL_VEL:   14,
+  TERMINAL_VEL:    6.5,    // max fall speed (was 14 — lower = more graceful)
   WORLD_W:        5000,
   WORLD_H:        1000,
   CAM_LERP:       0.09,
 };
 
-// ── roundRect polyfill (safety for older browsers) ────────────
-if (!CanvasRenderingContext2D.prototype.roundRect) {
-  CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
-    r = Math.min(r, w / 2, h / 2);
-    this.beginPath();
-    this.moveTo(x + r, y);
-    this.lineTo(x + w - r, y);
-    this.arcTo(x + w, y, x + w, y + r, r);
-    this.lineTo(x + w, y + h - r);
-    this.arcTo(x + w, y + h, x + w - r, y + h, r);
-    this.lineTo(x + r, y + h);
-    this.arcTo(x, y + h, x, y + h - r, r);
-    this.lineTo(x, y + r);
-    this.arcTo(x, y, x + r, y, r);
-    this.closePath();
-  };
-}
+// ── roundRect: always call beginPath() first ──────────────────
+// Native roundRect (Chrome/Safari/Firefox) does NOT call beginPath(),
+// so leftover paths from prior drawing get re-filled by subsequent fill().
+// We wrap the native to inject beginPath(), or install a full polyfill.
+(function() {
+  const proto = CanvasRenderingContext2D.prototype;
+  const _native = proto.roundRect;
+  if (_native) {
+    proto.roundRect = function(x, y, w, h, r) {
+      this.beginPath();
+      _native.call(this, x, y, w, h, r);
+    };
+  } else {
+    proto.roundRect = function(x, y, w, h, r) {
+      if (Array.isArray(r)) r = r[0] ?? 0;
+      r = Math.min(r || 0, w / 2, h / 2);
+      this.beginPath();
+      this.moveTo(x + r, y);
+      this.lineTo(x + w - r, y);
+      this.arcTo(x + w, y, x + w, y + r, r);
+      this.lineTo(x + w, y + h - r);
+      this.arcTo(x + w, y + h, x + w - r, y + h, r);
+      this.lineTo(x + r, y + h);
+      this.arcTo(x, y + h, x, y + h - r, r);
+      this.lineTo(x, y + r);
+      this.arcTo(x, y, x + r, y, r);
+      this.closePath();
+    };
+  }
+})();
 
 // ═══════════════════════════════════════════════════════════════
 //  INPUT  (keyboard + touch — both update the same logical state)
@@ -379,7 +393,7 @@ function drawStar(ctx, cx, cy, r, points, color) {
 //  All internal positions are fractions of w/h so they scale.
 // ═══════════════════════════════════════════════════════════════
 
-function drawPenelopeSprite(x, y, w, h, state, animFrame) {
+function drawPenelopeSprite(x, y, w, h, state, animFrame, aiming) {
   const cx = x + w / 2;
   const af = animFrame || 0;
   const run = state === 'run';
@@ -450,49 +464,116 @@ function drawPenelopeSprite(x, y, w, h, state, animFrame) {
   ctx.fillRect(cx - w*0.20, ankleY + legSwing*0.4 + 1, w*0.04, footY - ankleY - 2);
   ctx.fillRect(cx + w*0.02, ankleY - legSwing*0.4 + 1, w*0.04, footY - ankleY - 2);
 
-  // ── Bow arm (left, holds bow) ─────────────────────────────
-  ctx.strokeStyle = '#fde68a'; ctx.lineWidth = w * 0.13;
-  ctx.beginPath();
-  ctx.moveTo(cx - bw*0.45, shldY + (waistY-shldY)*0.1);
-  ctx.bezierCurveTo(cx - bw*0.6, shldY + (waistY-shldY)*0.5 + armSwing*0.3,
-                    cx - bw*0.65, waistY - (waistY-shldY)*0.15,
-                    cx - bw*0.58, waistY + armSwing*0.25);
-  ctx.stroke();
-  // Right arm (string arm)
-  ctx.beginPath();
-  ctx.moveTo(cx + bw*0.45, shldY + (waistY-shldY)*0.1);
-  ctx.bezierCurveTo(cx + bw*0.55, shldY + (waistY-shldY)*0.35 - armSwing*0.3,
-                    cx + bw*0.52, waistY - (waistY-shldY)*0.3,
-                    cx + bw*0.38, waistY - armSwing*0.25);
-  ctx.stroke();
+  // ── Arms & Bow ────────────────────────────────────────────────
+  // bowCX: bow's x position (always left side); bowH_sz: bow height (torso+)
+  const bowCX   = cx - bw * 0.64;
+  const bowH_sz = kneeY - shldY + h * 0.06; // big visible bow
 
-  // ── Bow ───────────────────────────────────────────────────
-  const bowX = cx - bw * 0.62;
-  const bowMY = shldY + (waistY - shldY) * 0.5 + armSwing * 0.25;
-  const bowH  = (waistY - shldY) * 0.7;
-  ctx.strokeStyle = '#78350f'; ctx.lineWidth = w * 0.055;
-  ctx.beginPath();
-  ctx.moveTo(bowX, bowMY - bowH * 0.5);
-  ctx.bezierCurveTo(bowX - w*0.18, bowMY - bowH*0.6, bowX - w*0.18, bowMY + bowH*0.6, bowX, bowMY + bowH*0.5);
-  ctx.stroke();
-  // Bow string
-  const pullX = bowX + w * 0.06;
-  ctx.strokeStyle = '#fef3c7'; ctx.lineWidth = w * 0.025;
-  ctx.beginPath(); ctx.moveTo(bowX, bowMY - bowH*0.5); ctx.lineTo(pullX, bowMY); ctx.lineTo(bowX, bowMY + bowH*0.5); ctx.stroke();
-  // Arrow nocked on string (ice blue, pointing right)
-  const arrowTip = cx + bw * 0.35;
-  ctx.strokeStyle = '#bae6fd'; ctx.lineWidth = w * 0.04;
-  ctx.beginPath(); ctx.moveTo(pullX, bowMY); ctx.lineTo(arrowTip, bowMY); ctx.stroke();
-  // Arrowhead
-  ctx.fillStyle = '#38bdf8';
-  ctx.beginPath(); ctx.moveTo(arrowTip + w*0.08, bowMY); ctx.lineTo(arrowTip, bowMY - w*0.045); ctx.lineTo(arrowTip, bowMY + w*0.045); ctx.closePath(); ctx.fill();
-  // Ice crystal shimmer on arrowhead
-  ctx.fillStyle = 'rgba(255,255,255,0.7)';
-  ctx.beginPath(); ctx.arc(arrowTip + w*0.04, bowMY - w*0.02, w*0.02, 0, Math.PI*2); ctx.fill();
-  // Fletching
-  ctx.strokeStyle = '#c7d2fe'; ctx.lineWidth = w * 0.03;
-  ctx.beginPath(); ctx.moveTo(pullX + w*0.02, bowMY); ctx.lineTo(pullX - w*0.06, bowMY - w*0.05); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(pullX + w*0.02, bowMY); ctx.lineTo(pullX - w*0.06, bowMY + w*0.05); ctx.stroke();
+  // lHandX/Y, rHandX/Y used again after the body for cuff drawing
+  let lHandX, lHandY, rHandX, rHandY;
+
+  if (aiming) {
+    // Raise bow to shoulder height; arrow nocked pointing right
+    const bowMY = shldY + (waistY - shldY) * 0.28;
+    const pullX  = bowCX + w * 0.26; // string pulled toward body
+    lHandX = bowCX + w*0.03; lHandY = bowMY;
+    rHandX = pullX;          rHandY = bowMY;
+
+    // Left arm: reaches to bow grip
+    ctx.strokeStyle = '#fde68a'; ctx.lineWidth = w * 0.13;
+    ctx.beginPath();
+    ctx.moveTo(cx - bw*0.4, shldY + (waistY-shldY)*0.08);
+    ctx.lineTo(lHandX, lHandY);
+    ctx.stroke();
+    // Right arm: pulls string
+    ctx.beginPath();
+    ctx.moveTo(cx + bw*0.4, shldY + (waistY-shldY)*0.08);
+    ctx.lineTo(rHandX, rHandY);
+    ctx.stroke();
+
+    // Bow body (tall dark arc)
+    ctx.strokeStyle = '#5c2d0a'; ctx.lineWidth = w * 0.082;
+    ctx.beginPath();
+    ctx.moveTo(bowCX, bowMY - bowH_sz*0.5);
+    ctx.bezierCurveTo(bowCX - w*0.24, bowMY - bowH_sz*0.58,
+                      bowCX - w*0.24, bowMY + bowH_sz*0.58,
+                      bowCX, bowMY + bowH_sz*0.5);
+    ctx.stroke();
+    // Wood highlight
+    ctx.strokeStyle = '#a16207'; ctx.lineWidth = w * 0.03;
+    ctx.beginPath();
+    ctx.moveTo(bowCX - w*0.01, bowMY - bowH_sz*0.3);
+    ctx.bezierCurveTo(bowCX - w*0.11, bowMY - bowH_sz*0.3,
+                      bowCX - w*0.11, bowMY + bowH_sz*0.3,
+                      bowCX - w*0.01, bowMY + bowH_sz*0.3);
+    ctx.stroke();
+    // String (pulled back)
+    ctx.strokeStyle = '#fef3c7'; ctx.lineWidth = w * 0.025;
+    ctx.beginPath();
+    ctx.moveTo(bowCX, bowMY - bowH_sz*0.5);
+    ctx.lineTo(pullX, bowMY);
+    ctx.lineTo(bowCX, bowMY + bowH_sz*0.5);
+    ctx.stroke();
+    // Ice arrow nocked, pointing right
+    const arrowTip = cx + bw * 0.6;
+    ctx.strokeStyle = '#bae6fd'; ctx.lineWidth = w * 0.05;
+    ctx.beginPath(); ctx.moveTo(pullX, bowMY); ctx.lineTo(arrowTip, bowMY); ctx.stroke();
+    ctx.fillStyle = '#38bdf8';
+    ctx.beginPath();
+    ctx.moveTo(arrowTip + w*0.09, bowMY);
+    ctx.lineTo(arrowTip, bowMY - w*0.058);
+    ctx.lineTo(arrowTip, bowMY + w*0.058);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.beginPath(); ctx.arc(arrowTip + w*0.04, bowMY - w*0.025, w*0.025, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#c7d2fe'; ctx.lineWidth = w * 0.035;
+    ctx.beginPath(); ctx.moveTo(pullX + w*0.02, bowMY); ctx.lineTo(pullX - w*0.08, bowMY - w*0.07); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pullX + w*0.02, bowMY); ctx.lineTo(pullX - w*0.08, bowMY + w*0.07); ctx.stroke();
+
+  } else {
+    // Resting: bow at left side, tip pointing down
+    const bowMY = shldY + (kneeY - shldY) * 0.52;
+    lHandX = bowCX + w*0.03; lHandY = bowMY - bowH_sz*0.1;
+    rHandX = cx + bw*0.38;   rHandY = waistY - armSwing*0.25;
+
+    // Left arm: hanging, gripping bow
+    ctx.strokeStyle = '#fde68a'; ctx.lineWidth = w * 0.13;
+    ctx.beginPath();
+    ctx.moveTo(cx - bw*0.4, shldY + (waistY-shldY)*0.08);
+    ctx.lineTo(lHandX, lHandY);
+    ctx.stroke();
+    // Right arm: relaxed
+    ctx.beginPath();
+    ctx.moveTo(cx + bw*0.45, shldY + (waistY-shldY)*0.1);
+    ctx.bezierCurveTo(cx + bw*0.55, shldY + (waistY-shldY)*0.35 - armSwing*0.3,
+                      cx + bw*0.52, waistY - (waistY-shldY)*0.3,
+                      rHandX, rHandY);
+    ctx.stroke();
+
+    // Bow body (tall dark arc, vertical)
+    ctx.strokeStyle = '#5c2d0a'; ctx.lineWidth = w * 0.082;
+    ctx.beginPath();
+    ctx.moveTo(bowCX, bowMY - bowH_sz*0.5);
+    ctx.bezierCurveTo(bowCX - w*0.24, bowMY - bowH_sz*0.58,
+                      bowCX - w*0.24, bowMY + bowH_sz*0.58,
+                      bowCX, bowMY + bowH_sz*0.5);
+    ctx.stroke();
+    // Wood highlight
+    ctx.strokeStyle = '#a16207'; ctx.lineWidth = w * 0.03;
+    ctx.beginPath();
+    ctx.moveTo(bowCX - w*0.01, bowMY - bowH_sz*0.3);
+    ctx.bezierCurveTo(bowCX - w*0.11, bowMY - bowH_sz*0.3,
+                      bowCX - w*0.11, bowMY + bowH_sz*0.3,
+                      bowCX - w*0.01, bowMY + bowH_sz*0.3);
+    ctx.stroke();
+    // String (resting, slightly curved)
+    ctx.strokeStyle = '#fef3c7'; ctx.lineWidth = w * 0.025;
+    ctx.beginPath();
+    ctx.moveTo(bowCX, bowMY - bowH_sz*0.5);
+    ctx.lineTo(bowCX + w*0.04, bowMY);
+    ctx.lineTo(bowCX, bowMY + bowH_sz*0.5);
+    ctx.stroke();
+  }
 
   // ── Body — jacket over striped shirt ─────────────────────
   // Striped shirt (center strip)
@@ -513,11 +594,11 @@ function drawPenelopeSprite(x, y, w, h, state, animFrame) {
   // Gold jacket outline
   ctx.strokeStyle = '#d97706'; ctx.lineWidth = w * 0.03;
   ctx.strokeRect(cx - bw*0.5, shldY, bw, waistY - shldY);
-  // Gold cuffs
+  // Gold cuffs (drawn after body so they appear on top)
   ctx.fillStyle = '#d97706';
   const cuffR = w * 0.09;
-  ctx.beginPath(); ctx.arc(cx - bw*0.58, waistY + armSwing*0.25, cuffR, 0, Math.PI*2); ctx.fill();
-  ctx.beginPath(); ctx.arc(cx + bw*0.38, waistY - armSwing*0.25, cuffR, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(lHandX, lHandY, cuffR, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(rHandX, rHandY, cuffR, 0, Math.PI*2); ctx.fill();
   // Black belt
   ctx.fillStyle = '#111827';
   ctx.roundRect(cx - bw*0.52, waistY - h*0.03, bw*1.04, h*0.06, h*0.02); ctx.fill();
@@ -891,8 +972,10 @@ class Projectile {
 // ── Shoot action — creates real projectiles ───────────────────
 function shootAction(player) {
   const type = player.character === 'penelope' ? 'ice' : 'vine';
+  if (player.character === 'penelope') player.shootTimer = 15;
   const ox = player.x + (player.facingRight ? player.w + 4 : -4);
-  const oy = player.y + player.h * 0.42;
+  // Penelope's arrow launches from shoulder height (raised bow); others from mid-body
+  const oy = player.y + (player.character === 'penelope' ? player.h * 0.30 : player.h * 0.42);
   const vx = player.facingRight ? 11 : -11;
   projectiles.push(new Projectile(ox, oy, vx, type));
   Particles.spawn(ox, oy, {
@@ -1068,6 +1151,7 @@ class Player {
     this.animTick  = 0;
     this.wingPhase = 0;       // for Parker's fairy wings
     this.dustTimer = 0;
+    this.shootTimer = 0;      // counts down after shooting; > 0 = aiming pose
   }
 
   update(platforms) {
@@ -1095,7 +1179,8 @@ class Player {
     if (!jumpKey) this.jumpHeld = false;
 
     // ── Gravity ───────────────────────────────────────────────
-    this.vy = Math.min(this.vy + CFG.GRAVITY, CFG.TERMINAL_VEL);
+    const grav = this.vy < 0 ? CFG.GRAVITY : CFG.FALL_GRAVITY;
+    this.vy = Math.min(this.vy + grav, CFG.TERMINAL_VEL);
 
     // ── Move & collide X ──────────────────────────────────────
     this.x += this.vx;
@@ -1131,6 +1216,7 @@ class Player {
     if (this.state !== 'run') this.animFrame = 0;
 
     this.wingPhase += 0.12;
+    if (this.shootTimer > 0) this.shootTimer--;
 
     // Running dust
     if (this.state === 'run' && this.onGround) {
@@ -1195,7 +1281,7 @@ class Player {
     ctx.translate(ox + w / 2, oy + h / 2 + bob);
     ctx.scale(sq.sx, sq.sy);
     if (this.character === 'penelope')
-      drawPenelopeSprite(-w/2, -h/2, w, h, this.state, this.animFrame);
+      drawPenelopeSprite(-w/2, -h/2, w, h, this.state, this.animFrame, this.shootTimer > 0);
     else
       drawParkerSprite(-w/2, -h/2, w, h, this.state, this.animFrame, this.wingPhase);
     ctx.restore();
@@ -1484,7 +1570,7 @@ const SelectScreen = (() => {
       const bob = Math.sin(t * 0.05 + (isPen ? 0 : 1)) * 4;
       ctx.save();
       ctx.translate(pcx, pcy + bob);
-      if (isPen) drawPenelopeSprite(-PW/2, -PH/2, PW, PH, 'idle', t);
+      if (isPen) drawPenelopeSprite(-PW/2, -PH/2, PW, PH, 'idle', t, false);
       else       drawParkerSprite(-PW/2, -PH/2, PW, PH, isPen ? 'idle' : (Math.sin(t*0.03) > 0 ? 'jump' : 'idle'), t, t * 0.08);
       ctx.restore();
 
